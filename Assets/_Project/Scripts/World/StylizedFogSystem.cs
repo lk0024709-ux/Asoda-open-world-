@@ -160,6 +160,16 @@ namespace Asoda.World
         }
 
         /// <summary>
+        /// Re-binds to the active MainCamera (e.g., after <c>ThirdPersonCamera</c> spawns) and Directional Sun immediately.
+        /// </summary>
+        public void RefreshCameraAndLightingImmediate()
+        {
+            _syncedCamera = null;
+            _syncedSunLight = null;
+            SyncCameraAndSun();
+        }
+
+        /// <summary>
         /// Recomputes fog start/end distances so linear fog reaches 100% opacity strictly inside the chunk streaming edge.
         /// </summary>
         public void RecalculateFogDistancesFromChunks()

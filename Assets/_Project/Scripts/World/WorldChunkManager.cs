@@ -200,6 +200,19 @@ namespace Asoda.World
         }
 
         /// <summary>
+        /// Synchronously streams all initial chunks around <paramref name="initialWorldPosition"/>
+        /// so terrain colliders and static buildings are ready before spawning the Player and Camera.
+        /// </summary>
+        public void PrepareInitialWorldAt(Vector3 initialWorldPosition)
+        {
+            SetTrackingPosition(initialWorldPosition);
+            if (!_hasInitialSync)
+            {
+                Tick(0f);
+            }
+        }
+
+        /// <summary>
         /// Assigns the Player transform whose XZ coordinates drive chunk loading and unloading.
         /// </summary>
         public void SetTrackingTarget(Transform target)
