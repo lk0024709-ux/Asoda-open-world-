@@ -1,3 +1,4 @@
+using Asoda.World;
 using UnityEngine;
 
 namespace Asoda.Core
@@ -62,9 +63,14 @@ namespace Asoda.Core
         /// </summary>
         private static void RegisterCoreSystems(GameManager gameManager)
         {
-            // Register pure C# World, Player, and Streaming systems here as they are implemented:
-            // e.g., gameManager.RegisterSystem(new WorldStreamingSystem(), priority: -50);
-            // e.g., gameManager.RegisterSystem(new PlayerSystem(), priority: 0);
+            var mapDataLoader = new MapDataLoader(WorldChunkManager.DefaultChunkSize);
+            var worldChunkManager = new WorldChunkManager(
+                mapDataLoader,
+                chunkSize: WorldChunkManager.DefaultChunkSize,
+                loadRadius: WorldChunkManager.DefaultLoadRadius);
+
+            gameManager.RegisterSystem(new WorldTestPreviewSystem(worldChunkManager), priority: -25);
+            gameManager.RegisterSystem(worldChunkManager, priority: 50);
         }
     }
 }
