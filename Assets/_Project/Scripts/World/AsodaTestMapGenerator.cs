@@ -119,6 +119,9 @@ namespace Asoda.World
                 }
             }
 
+            // Parked starter auto-rickshaw right at Asoda Chowk near player spawn
+            AppendEntry(sb, ref first, "Vehicle", -3.2f, -6.5f, 180f, 1.0f, 0);
+
             float[] roadPositions = { -135f, -95f, -55f, -24f, 22f, 58f, 96f, 138f };
             for (int i = 0; i < roadPositions.Length; i++)
             {

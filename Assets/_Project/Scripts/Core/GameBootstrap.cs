@@ -6,8 +6,8 @@ using UnityEngine;
 namespace Asoda.Core
 {
     /// <summary>
-    /// Zero-scene entry point that initializes the game purely from C# code
-    /// before and after the initial Unity scene loads—requiring zero manual Editor prefabs or scene setup.
+    /// Zero-scene entry point that initializes the complete Asoda GTA-style open-world gameplay loop
+    /// purely from C# code before and after the initial Unity scene loads—requiring zero manual prefabs.
     /// </summary>
     public static class GameBootstrap
     {
@@ -63,14 +63,14 @@ namespace Asoda.Core
                 ? worldChunkManager.Pool.WorldRootTransform
                 : null);
 
-            // 2. Build runtime Mobile Touch UI (EventSystem, Canvas, Joystick, Camera Swipe Zone, Jump Button)
+            // 2. Build runtime Mobile Touch UI (EventSystem, Canvas, Joystick, Camera Swipe Zone, Circular Action Clusters)
             touchInput?.EnsureTouchUiCreated();
 
             // 3. Synchronously stream & static-batch initial world chunks around the spawn point BEFORE spawning Player
             worldChunkManager?.PrepareInitialWorldAt(DefaultPlayerSpawnPosition);
             staticMeshCombiner?.FlushPendingCombinesImmediate();
 
-            // 4. Spawn Player (placeholder capsule if no Prefabs/Player asset exists) & auto-bind to WorldChunkManager
+            // 4. Spawn Player (placeholder articulated low-poly player if no Prefabs/Player asset exists) & bind to WorldChunkManager
             var playerController = new PlayerController(
                 touchInput,
                 worldChunkManager,
@@ -81,12 +81,38 @@ namespace Asoda.Core
             var thirdPersonCamera = new ThirdPersonCamera(
                 playerController.PlayerTransform,
                 touchInput);
-            gameManager.RegisterSystem(thirdPersonCamera, priority: 75);
+            gameManager.RegisterSystem(thirdPersonCamera, priority: 80);
 
             playerController.SetCameraTransform(thirdPersonCamera.CameraTransform);
             stylizedFogSystem?.RefreshCameraAndLightingImmediate();
 
-            // 6. Start the active 60 FPS pure C# game loop
+            // 6. Register Vehicle & Mission Interaction System (Physics.OverlapSphere + Vehicle Driving + EXIT)
+            var interactionSystem = new InteractionSystem(
+                touchInput,
+                playerController,
+                thirdPersonCamera,
+                worldChunkManager);
+            gameManager.RegisterSystem(interactionSystem, priority: 10);
+
+            // 7. Register Hand-to-Hand Punching & Raycast Weapon Combat System (Resources/Prefabs/Weapons/)
+            var combatController = new PlayerCombatController(
+                touchInput,
+                playerController,
+                thirdPersonCamera,
+                interactionSystem);
+            gameManager.RegisterSystem(combatController, priority: 20);
+
+            // 8. Register Advanced HUD & Masked Circular Minimap System (Zero Second Camera)
+            var hudManager = new HudManager(
+                touchInput,
+                playerController,
+                thirdPersonCamera,
+                worldChunkManager,
+                interactionSystem,
+                combatController);
+            gameManager.RegisterSystem(hudManager, priority: 70);
+
+            // 9. Start the active 60 FPS pure C# game loop
             gameManager.StartGameLoop();
         }
 
@@ -99,9 +125,11 @@ namespace Asoda.Core
 
         /// <summary>
         /// Registers core input, rendering optimization, and world streaming systems into <see cref="GameManager"/>.
-        /// Execution order per frame:
-        ///   Update: TouchInputManager (-100) -> StylizedFog (-20) -> DynamicLod (-10) -> PlayerController (0) -> WorldChunkManager (50) -> StaticMeshCombiner (60)
-        ///   LateUpdate: ThirdPersonCamera (75)
+        /// Deterministic per-frame execution order:
+        ///   Update: TouchInputManager (-100) -> StylizedFog (-20) -> DynamicLod (-10) -> PlayerController (0)
+        ///           -> InteractionSystem (10) -> PlayerCombatController (20) -> WorldChunkManager (50)
+        ///           -> StaticMeshCombiner (60) -> HudManager (70)
+        ///   LateUpdate: ThirdPersonCamera (80)
         /// </summary>
         private static void RegisterWorldAndInputSystems(GameManager gameManager)
         {
