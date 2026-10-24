@@ -1,0 +1,1104 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using UnityEngine;
+using UnityEngine.Rendering;
+using Object = UnityEngine.Object;
+
+namespace Asoda.World
+{
+    /// <summary>
+    /// Compact 24-byte value-type placement record parsed from map_data.json.
+    /// Contains zero managed references to avoid GC pressure on large maps.
+    /// </summary>
+    public readonly struct MapObjectRecord
+    {
+        public readonly float X;
+        public readonly float Y;
+        public readonly float Z;
+        public readonly float RotationY;
+        public readonly float Scale;
+        public readonly ushort AssetTypeId;
+        public readonly ushort Variant;
+
+        public MapObjectRecord(float x, float y, float z, float rotationY, float scale, ushort assetTypeId, ushort variant)
+        {
+            X = x;
+            Y = y;
+            Z = z;
+            RotationY = rotationY;
+            Scale = scale;
+            AssetTypeId = assetTypeId;
+            Variant = variant;
+        }
+    }
+
+    /// <summary>
+    /// High-performance single-pass JSON map loader, spatial chunk bucketer, and GPU-instanced prefab pooler.
+    /// Parses map_data.json with zero substring allocations for coordinates/known types and spawns pooled
+    /// prefabs into active 50x50 chunk boundaries.
+    /// </summary>
+    public sealed class MapDataLoader
+    {
+        public const string DefaultResourceName = "map_data";
+        public const string PrefabResourceFolder = "Prefabs/";
+
+        private static readonly int BaseColorPropertyId = Shader.PropertyToID("_BaseColor");
+        private static readonly int LegacyColorPropertyId = Shader.PropertyToID("_Color");
+
+        private sealed class AssetTypeSlot
+        {
+            public ushort Id;
+            public string Name;
+            public uint NameHash;
+            public GameObject Template;
+            public bool IsProceduralFallback;
+            public Color[] InstancedPalette;
+            public readonly Stack<PooledPropInstance> Pool = new Stack<PooledPropInstance>(32);
+        }
+
+        private readonly float _chunkSize;
+        private readonly Dictionary<ChunkCoord, List<MapObjectRecord>> _chunkBuckets = new Dictionary<ChunkCoord, List<MapObjectRecord>>(128);
+        private readonly List<AssetTypeSlot> _assetTypes = new List<AssetTypeSlot>(16);
+        private readonly Dictionary<string, ushort> _customPrefabLookup = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<Material> _runtimeMaterials = new List<Material>(16);
+        private readonly MaterialPropertyBlock _sharedPropertyBlock = new MaterialPropertyBlock();
+
+        private Transform _templatesRoot;
+        private Transform _pooledPropsRoot;
+        private int _totalObjectCount;
+
+        public int TotalObjectCount => _totalObjectCount;
+        public int PopulatedChunkCount => _chunkBuckets.Count;
+
+        public MapDataLoader(float chunkSize = WorldChunkManager.DefaultChunkSize)
+        {
+            _chunkSize = chunkSize;
+            PreRegisterCoreAssetTypes();
+        }
+
+        /// <summary>
+        /// Attaches the internal prop pool hierarchy under the persistent world streaming root.
+        /// </summary>
+        public void AttachPoolRoot(Transform worldRoot)
+        {
+            if (_pooledPropsRoot != null)
+            {
+                return;
+            }
+
+            var templatesGo = new GameObject("PrototypeTemplates");
+            templatesGo.SetActive(false);
+            _templatesRoot = templatesGo.transform;
+            _templatesRoot.SetParent(worldRoot, false);
+
+            var poolGo = new GameObject("PooledProps");
+            _pooledPropsRoot = poolGo.transform;
+            _pooledPropsRoot.SetParent(worldRoot, false);
+        }
+
+        /// <summary>
+        /// Explicitly registers a custom Unity prefab (e.g., imported Blender asset) for an asset type string
+        /// and enables GPU instancing on all shared materials.
+        /// </summary>
+        public void RegisterPrefab(string assetType, GameObject prefab)
+        {
+            if (string.IsNullOrEmpty(assetType) || prefab == null)
+            {
+                return;
+            }
+
+            ushort id = ResolveOrRegisterAssetType(assetType, 0, assetType.Length);
+            AssetTypeSlot slot = _assetTypes[id];
+            slot.Template = prefab;
+            slot.IsProceduralFallback = false;
+            EnableGpuInstancingOnHierarchy(prefab);
+        }
+
+        /// <summary>
+        /// Loads map_data.json from persistentDataPath override, Resources/map_data, StreamingAssets,
+        /// or falls back to procedural Asoda test JSON if none exists yet.
+        /// </summary>
+        public void LoadDefaultMapData()
+        {
+            string json = TryReadMapJsonText();
+            if (string.IsNullOrEmpty(json))
+            {
+                json = AsodaTestMapGenerator.GenerateDummyMapJson();
+            }
+
+            LoadFromJson(json);
+        }
+
+        /// <summary>
+        /// Parses raw map_data.json text in a single zero-substring pass and buckets placements by 50x50 chunk coordinates.
+        /// </summary>
+        public void LoadFromJson(string json)
+        {
+            _chunkBuckets.Clear();
+            _totalObjectCount = 0;
+
+            if (string.IsNullOrEmpty(json))
+            {
+                return;
+            }
+
+            int cursor = 0;
+            int length = json.Length;
+            SkipWhitespace(json, length, ref cursor);
+
+            if (cursor >= length)
+            {
+                return;
+            }
+
+            char first = json[cursor];
+            if (first == '[')
+            {
+                ParsePlacementsArray(json, length, ref cursor);
+            }
+            else if (first == '{')
+            {
+                cursor++; // skip '{'
+                while (cursor < length)
+                {
+                    SkipWhitespace(json, length, ref cursor);
+                    if (cursor >= length || json[cursor] == '}')
+                    {
+                        cursor++;
+                        break;
+                    }
+
+                    if (!TryReadQuotedSlice(json, length, ref cursor, out int keyStart, out int keyLen))
+                    {
+                        break;
+                    }
+
+                    SkipWhitespace(json, length, ref cursor);
+                    if (cursor < length && json[cursor] == ':')
+                    {
+                        cursor++;
+                    }
+
+                    SkipWhitespace(json, length, ref cursor);
+                    if (cursor < length && json[cursor] == '[' &&
+                        (SliceEqualsIgnoreCase(json, keyStart, keyLen, "objects") ||
+                         SliceEqualsIgnoreCase(json, keyStart, keyLen, "items") ||
+                         SliceEqualsIgnoreCase(json, keyStart, keyLen, "placements") ||
+                         SliceEqualsIgnoreCase(json, keyStart, keyLen, "entities")))
+                    {
+                        ParsePlacementsArray(json, length, ref cursor);
+                    }
+                    else
+                    {
+                        SkipJsonValue(json, length, ref cursor);
+                    }
+
+                    SkipWhitespace(json, length, ref cursor);
+                    if (cursor < length && json[cursor] == ',')
+                    {
+                        cursor++;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Pre-warms pooled prop instances per asset type so initial chunk transitions do not spike frame times.
+        /// </summary>
+        public void PrewarmPropPools(int countPerCommonType = 24)
+        {
+            for (int i = 0; i < _assetTypes.Count; i++)
+            {
+                AssetTypeSlot slot = _assetTypes[i];
+                EnsureSlotTemplate(slot);
+                if (slot.Template == null)
+                {
+                    continue;
+                }
+
+                int targetCount = (i <= 1) ? countPerCommonType : Mathf.Max(6, countPerCommonType / 3);
+                while (slot.Pool.Count < targetCount)
+                {
+                    PooledPropInstance instance = CreatePropInstance(slot);
+                    instance.GameObject.SetActive(false);
+                    instance.Transform.SetParent(_pooledPropsRoot, false);
+                    slot.Pool.Push(instance);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Spawns all map objects falling within the target chunk's 50x50 boundaries using pooled instances
+        /// and GPU-instanced MaterialPropertyBlock variations.
+        /// </summary>
+        public int PopulateChunk(WorldChunk chunk)
+        {
+            if (chunk == null || !_chunkBuckets.TryGetValue(chunk.Coord, out List<MapObjectRecord> records))
+            {
+                return 0;
+            }
+
+            ChunkBounds bounds = chunk.Bounds;
+            Transform chunkRoot = chunk.RootTransform;
+            int spawnedCount = 0;
+
+            for (int i = 0; i < records.Count; i++)
+            {
+                MapObjectRecord record = records[i];
+                if (!bounds.Contains(record.X, record.Z))
+                {
+                    continue;
+                }
+
+                PooledPropInstance instance = AcquireProp(record.AssetTypeId);
+                if (instance == null)
+                {
+                    continue;
+                }
+
+                Transform propTransform = instance.Transform;
+                propTransform.SetParent(chunkRoot, false);
+                propTransform.localPosition = new Vector3(
+                    record.X - bounds.MinX,
+                    record.Y,
+                    record.Z - bounds.MinZ);
+                propTransform.localRotation = Quaternion.Euler(0f, record.RotationY, 0f);
+                propTransform.localScale = Vector3.one * record.Scale;
+
+                ApplyGpuInstancedVariation(instance, record);
+
+                instance.GameObject.SetActive(true);
+                chunk.SpawnedProps.Add(instance);
+                spawnedCount++;
+            }
+
+            return spawnedCount;
+        }
+
+        /// <summary>
+        /// Returns all spawned prop instances inside an unloading chunk back to their respective object pools.
+        /// </summary>
+        public void ClearChunk(WorldChunk chunk)
+        {
+            if (chunk == null)
+            {
+                return;
+            }
+
+            List<PooledPropInstance> spawned = chunk.SpawnedProps;
+            for (int i = 0; i < spawned.Count; i++)
+            {
+                PooledPropInstance instance = spawned[i];
+                if (instance == null || instance.GameObject == null)
+                {
+                    continue;
+                }
+
+                instance.GameObject.SetActive(false);
+                if (_pooledPropsRoot != null)
+                {
+                    instance.Transform.SetParent(_pooledPropsRoot, false);
+                }
+
+                _assetTypes[instance.AssetTypeId].Pool.Push(instance);
+            }
+
+            spawned.Clear();
+        }
+
+        /// <summary>
+        /// Cleans up runtime fallback materials on application shutdown.
+        /// </summary>
+        public void Dispose()
+        {
+            _chunkBuckets.Clear();
+
+            for (int i = 0; i < _runtimeMaterials.Count; i++)
+            {
+                if (_runtimeMaterials[i] != null)
+                {
+                    Object.Destroy(_runtimeMaterials[i]);
+                }
+            }
+
+            _runtimeMaterials.Clear();
+        }
+
+        #region Fast Single-Pass JSON Parser
+
+        private void ParsePlacementsArray(string json, int length, ref int cursor)
+        {
+            cursor++; // skip '['
+            while (cursor < length)
+            {
+                SkipWhitespace(json, length, ref cursor);
+                if (cursor >= length)
+                {
+                    break;
+                }
+
+                if (json[cursor] == ']')
+                {
+                    cursor++;
+                    break;
+                }
+
+                if (json[cursor] == '{')
+                {
+                    ParseSinglePlacementObject(json, length, ref cursor);
+                }
+                else
+                {
+                    SkipJsonValue(json, length, ref cursor);
+                }
+
+                SkipWhitespace(json, length, ref cursor);
+                if (cursor < length && json[cursor] == ',')
+                {
+                    cursor++;
+                }
+            }
+        }
+
+        private void ParseSinglePlacementObject(string json, int length, ref int cursor)
+        {
+            cursor++; // skip '{'
+
+            float x = 0f;
+            float y = 0f;
+            float z = 0f;
+            float rotationY = 0f;
+            float scale = 1f;
+            ushort typeId = 0;
+            ushort variant = 0;
+            bool hasType = false;
+            bool hasVariant = false;
+
+            while (cursor < length)
+            {
+                SkipWhitespace(json, length, ref cursor);
+                if (cursor >= length)
+                {
+                    break;
+                }
+
+                if (json[cursor] == '}')
+                {
+                    cursor++;
+                    break;
+                }
+
+                if (!TryReadQuotedSlice(json, length, ref cursor, out int kStart, out int kLen))
+                {
+                    break;
+                }
+
+                SkipWhitespace(json, length, ref cursor);
+                if (cursor < length && json[cursor] == ':')
+                {
+                    cursor++;
+                }
+
+                SkipWhitespace(json, length, ref cursor);
+
+                if (kLen == 1)
+                {
+                    char k = json[kStart];
+                    if (k == 'x' || k == 'X')
+                    {
+                        ParseFloat(json, length, ref cursor, out x);
+                    }
+                    else if (k == 'y' || k == 'Y')
+                    {
+                        ParseFloat(json, length, ref cursor, out y);
+                    }
+                    else if (k == 'z' || k == 'Z')
+                    {
+                        ParseFloat(json, length, ref cursor, out z);
+                    }
+                    else
+                    {
+                        SkipJsonValue(json, length, ref cursor);
+                    }
+                }
+                else if (SliceEqualsIgnoreCase(json, kStart, kLen, "type") ||
+                         SliceEqualsIgnoreCase(json, kStart, kLen, "assetType") ||
+                         SliceEqualsIgnoreCase(json, kStart, kLen, "prefab"))
+                {
+                    if (TryReadQuotedSlice(json, length, ref cursor, out int vStart, out int vLen) && vLen > 0)
+                    {
+                        typeId = ResolveOrRegisterAssetType(json, vStart, vLen);
+                        hasType = true;
+                    }
+                }
+                else if (SliceEqualsIgnoreCase(json, kStart, kLen, "rotationY") ||
+                         SliceEqualsIgnoreCase(json, kStart, kLen, "rotY") ||
+                         SliceEqualsIgnoreCase(json, kStart, kLen, "yaw") ||
+                         SliceEqualsIgnoreCase(json, kStart, kLen, "rotation"))
+                {
+                    ParseFloat(json, length, ref cursor, out rotationY);
+                }
+                else if (SliceEqualsIgnoreCase(json, kStart, kLen, "scale"))
+                {
+                    ParseFloat(json, length, ref cursor, out scale);
+                }
+                else if (SliceEqualsIgnoreCase(json, kStart, kLen, "variant"))
+                {
+                    ParseFloat(json, length, ref cursor, out float rawVariant);
+                    variant = (ushort)Mathf.Clamp(Mathf.RoundToInt(rawVariant), 0, ushort.MaxValue);
+                    hasVariant = true;
+                }
+                else
+                {
+                    SkipJsonValue(json, length, ref cursor);
+                }
+
+                SkipWhitespace(json, length, ref cursor);
+                if (cursor < length && json[cursor] == ',')
+                {
+                    cursor++;
+                }
+            }
+
+            if (!hasType)
+            {
+                return;
+            }
+
+            if (scale <= 0.001f)
+            {
+                scale = 1f;
+            }
+
+            if (!hasVariant)
+            {
+                int spatialSeed = unchecked((Mathf.RoundToInt(x * 10f) * 73856093) ^ (Mathf.RoundToInt(z * 10f) * 19349663));
+                variant = (ushort)(spatialSeed & 0xFFFF);
+            }
+
+            var record = new MapObjectRecord(x, y, z, rotationY, scale, typeId, variant);
+            ChunkCoord coord = ChunkCoord.FromWorldPosition(x, z, _chunkSize);
+
+            if (!_chunkBuckets.TryGetValue(coord, out List<MapObjectRecord> bucket))
+            {
+                bucket = new List<MapObjectRecord>(32);
+                _chunkBuckets[coord] = bucket;
+            }
+
+            bucket.Add(record);
+            _totalObjectCount++;
+        }
+
+        private static void SkipWhitespace(string json, int length, ref int cursor)
+        {
+            while (cursor < length)
+            {
+                char c = json[cursor];
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+                {
+                    return;
+                }
+
+                cursor++;
+            }
+        }
+
+        private static bool TryReadQuotedSlice(string json, int length, ref int cursor, out int sliceStart, out int sliceLength)
+        {
+            SkipWhitespace(json, length, ref cursor);
+            if (cursor >= length || json[cursor] != '"')
+            {
+                sliceStart = 0;
+                sliceLength = 0;
+                return false;
+            }
+
+            cursor++; // skip opening quote
+            sliceStart = cursor;
+
+            while (cursor < length)
+            {
+                char c = json[cursor];
+                if (c == '\\')
+                {
+                    cursor += 2;
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    sliceLength = cursor - sliceStart;
+                    cursor++; // skip closing quote
+                    return true;
+                }
+
+                cursor++;
+            }
+
+            sliceLength = 0;
+            return false;
+        }
+
+        private static void ParseFloat(string json, int length, ref int cursor, out float result)
+        {
+            SkipWhitespace(json, length, ref cursor);
+
+            bool negative = false;
+            if (cursor < length)
+            {
+                char sign = json[cursor];
+                if (sign == '-')
+                {
+                    negative = true;
+                    cursor++;
+                }
+                else if (sign == '+')
+                {
+                    cursor++;
+                }
+            }
+
+            double value = 0.0;
+            while (cursor < length)
+            {
+                int digit = json[cursor] - '0';
+                if ((uint)digit > 9u)
+                {
+                    break;
+                }
+
+                value = (value * 10.0) + digit;
+                cursor++;
+            }
+
+            if (cursor < length && json[cursor] == '.')
+            {
+                cursor++;
+                double divisor = 10.0;
+                while (cursor < length)
+                {
+                    int digit = json[cursor] - '0';
+                    if ((uint)digit > 9u)
+                    {
+                        break;
+                    }
+
+                    value += digit / divisor;
+                    divisor *= 10.0;
+                    cursor++;
+                }
+            }
+
+            if (cursor < length && (json[cursor] == 'e' || json[cursor] == 'E'))
+            {
+                cursor++;
+                bool expNeg = false;
+                if (cursor < length)
+                {
+                    if (json[cursor] == '-')
+                    {
+                        expNeg = true;
+                        cursor++;
+                    }
+                    else if (json[cursor] == '+')
+                    {
+                        cursor++;
+                    }
+                }
+
+                int exp = 0;
+                while (cursor < length)
+                {
+                    int digit = json[cursor] - '0';
+                    if ((uint)digit > 9u)
+                    {
+                        break;
+                    }
+
+                    exp = (exp * 10) + digit;
+                    cursor++;
+                }
+
+                if (exp != 0)
+                {
+                    double factor = Math.Pow(10.0, exp);
+                    value = expNeg ? (value / factor) : (value * factor);
+                }
+            }
+
+            result = negative ? -(float)value : (float)value;
+        }
+
+        private static void SkipJsonValue(string json, int length, ref int cursor)
+        {
+            SkipWhitespace(json, length, ref cursor);
+            if (cursor >= length)
+            {
+                return;
+            }
+
+            char c = json[cursor];
+            if (c == '"')
+            {
+                TryReadQuotedSlice(json, length, ref cursor, out _, out _);
+                return;
+            }
+
+            if (c == '{' || c == '[')
+            {
+                char open = c;
+                char close = (c == '{') ? '}' : ']';
+                int depth = 1;
+                cursor++;
+
+                while (cursor < length && depth > 0)
+                {
+                    char ch = json[cursor];
+                    if (ch == '"')
+                    {
+                        TryReadQuotedSlice(json, length, ref cursor, out _, out _);
+                        continue;
+                    }
+
+                    if (ch == open)
+                    {
+                        depth++;
+                    }
+                    else if (ch == close)
+                    {
+                        depth--;
+                    }
+
+                    cursor++;
+                }
+
+                return;
+            }
+
+            while (cursor < length)
+            {
+                char ch = json[cursor];
+                if (ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+                {
+                    break;
+                }
+
+                cursor++;
+            }
+        }
+
+        private static bool SliceEqualsIgnoreCase(string text, int start, int length, string target)
+        {
+            if (length != target.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < length; i++)
+            {
+                char a = text[start + i];
+                char b = target[i];
+                if (a == b)
+                {
+                    continue;
+                }
+
+                if (a >= 'A' && a <= 'Z')
+                {
+                    a = (char)(a + 32);
+                }
+
+                if (b >= 'A' && b <= 'Z')
+                {
+                    b = (char)(b + 32);
+                }
+
+                if (a != b)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static uint ComputeSliceHashIgnoreCase(string text, int start, int length)
+        {
+            uint hash = 2166136261u;
+            for (int i = 0; i < length; i++)
+            {
+                char c = text[start + i];
+                if (c >= 'A' && c <= 'Z')
+                {
+                    c = (char)(c + 32);
+                }
+
+                hash ^= c;
+                hash *= 16777619u;
+            }
+
+            return hash;
+        }
+
+        #endregion
+
+        #region Asset Type Registry, Pooling & GPU Instancing
+
+        private void PreRegisterCoreAssetTypes()
+        {
+            // Repeating Indian town & rural open-world palettes for GPU-instanced MaterialPropertyBlock variation
+            RegisterAssetSlot("Building", new[]
+            {
+                new Color(0.89f, 0.76f, 0.58f, 1f), // Warm sandstone ochre
+                new Color(0.84f, 0.56f, 0.42f, 1f), // Terracotta brick
+                new Color(0.92f, 0.89f, 0.82f, 1f), // Sun-washed chunam limewash
+                new Color(0.72f, 0.82f, 0.90f, 1f), // Jodhpur/Rajasthani blue wash
+                new Color(0.88f, 0.79f, 0.50f, 1f)  // Mustard facade
+            });
+
+            RegisterAssetSlot("Tree", new[]
+            {
+                new Color(0.24f, 0.54f, 0.22f, 1f), // Neem green
+                new Color(0.19f, 0.46f, 0.20f, 1f), // Deep banyan canopy
+                new Color(0.32f, 0.59f, 0.24f, 1f), // Fresh mango foliage
+                new Color(0.28f, 0.50f, 0.26f, 1f)  // Peepal olive-green
+            });
+
+            RegisterAssetSlot("Vehicle", new[]
+            {
+                new Color(0.16f, 0.56f, 0.29f, 1f), // Classic green/yellow auto-rickshaw body
+                new Color(0.84f, 0.65f, 0.16f, 1f), // Yellow taxi/auto
+                new Color(0.78f, 0.25f, 0.22f, 1f), // Red rural tractor/hatchback
+                new Color(0.86f, 0.88f, 0.90f, 1f)  // White utility SUV/van
+            });
+
+            RegisterAssetSlot("Mandir", new[]
+            {
+                new Color(0.93f, 0.62f, 0.28f, 1f), // Saffron-sandstone shikhara
+                new Color(0.90f, 0.74f, 0.52f, 1f)  // Carved buff sandstone
+            });
+
+            RegisterAssetSlot("Lake", new[]
+            {
+                new Color(0.16f, 0.49f, 0.64f, 1f), // Deep sarovar water
+                new Color(0.20f, 0.54f, 0.68f, 1f)  // Shallow ghat water
+            });
+
+            RegisterAssetSlot("House", new[]
+            {
+                new Color(0.88f, 0.74f, 0.56f, 1f),
+                new Color(0.85f, 0.60f, 0.46f, 1f),
+                new Color(0.91f, 0.88f, 0.80f, 1f)
+            });
+        }
+
+        private ushort RegisterAssetSlot(string name, Color[] palette)
+        {
+            ushort id = (ushort)_assetTypes.Count;
+            var slot = new AssetTypeSlot
+            {
+                Id = id,
+                Name = name,
+                NameHash = ComputeSliceHashIgnoreCase(name, 0, name.Length),
+                InstancedPalette = palette
+            };
+            _assetTypes.Add(slot);
+            _customPrefabLookup[name] = id;
+            return id;
+        }
+
+        private ushort ResolveOrRegisterAssetType(string text, int start, int length)
+        {
+            uint hash = ComputeSliceHashIgnoreCase(text, start, length);
+            for (int i = 0; i < _assetTypes.Count; i++)
+            {
+                AssetTypeSlot existing = _assetTypes[i];
+                if (existing.NameHash == hash && SliceEqualsIgnoreCase(text, start, length, existing.Name))
+                {
+                    return existing.Id;
+                }
+            }
+
+            string newTypeName = text.Substring(start, length);
+            return RegisterAssetSlot(newTypeName, null);
+        }
+
+        private PooledPropInstance AcquireProp(ushort assetTypeId)
+        {
+            if (assetTypeId >= _assetTypes.Count)
+            {
+                return null;
+            }
+
+            AssetTypeSlot slot = _assetTypes[assetTypeId];
+            if (slot.Pool.Count > 0)
+            {
+                return slot.Pool.Pop();
+            }
+
+            EnsureSlotTemplate(slot);
+            return slot.Template != null ? CreatePropInstance(slot) : null;
+        }
+
+        private void EnsureSlotTemplate(AssetTypeSlot slot)
+        {
+            if (slot.Template != null)
+            {
+                return;
+            }
+
+            // 1. Check project Resources/Prefabs/<AssetName> for imported Blender prefabs
+            GameObject projectPrefab = Resources.Load<GameObject>(PrefabResourceFolder + slot.Name);
+            if (projectPrefab != null)
+            {
+                EnableGpuInstancingOnHierarchy(projectPrefab);
+                slot.Template = projectPrefab;
+                slot.IsProceduralFallback = false;
+                return;
+            }
+
+            // 2. Fallback: build a GPU-instanced low-poly placeholder prototype for immediate testing
+            slot.Template = BuildProceduralPrototype(slot.Name);
+            slot.IsProceduralFallback = true;
+        }
+
+        private PooledPropInstance CreatePropInstance(AssetTypeSlot slot)
+        {
+            GameObject instanceGo = Object.Instantiate(slot.Template, _pooledPropsRoot, false);
+            instanceGo.name = slot.Name;
+
+            MeshRenderer[] renderers;
+            if (slot.IsProceduralFallback)
+            {
+                // Tint only the primary surface renderer (index 0) on multi-part fallback prototypes
+                // so tree trunks, roofs, and vehicle canopies preserve their distinct shared materials.
+                MeshRenderer primary = instanceGo.GetComponentInChildren<MeshRenderer>(true);
+                renderers = primary != null ? new[] { primary } : Array.Empty<MeshRenderer>();
+            }
+            else
+            {
+                renderers = instanceGo.GetComponentsInChildren<MeshRenderer>(true);
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    EnableGpuInstancingOnRenderer(renderers[i]);
+                }
+            }
+
+            return new PooledPropInstance(slot.Id, instanceGo, renderers);
+        }
+
+        private void ApplyGpuInstancedVariation(PooledPropInstance instance, MapObjectRecord record)
+        {
+            MeshRenderer[] renderers = instance.Renderers;
+            if (renderers == null || renderers.Length == 0)
+            {
+                return;
+            }
+
+            AssetTypeSlot slot = _assetTypes[instance.AssetTypeId];
+            Color[] palette = slot.InstancedPalette;
+            if (palette == null || palette.Length == 0)
+            {
+                return;
+            }
+
+            Color chosenColor = palette[record.Variant % palette.Length];
+            if (!slot.IsProceduralFallback)
+            {
+                // On textured Blender prefabs, blend subtly toward white so albedo textures stay crisp
+                chosenColor = Color.Lerp(Color.white, chosenColor, 0.18f);
+            }
+
+            _sharedPropertyBlock.Clear();
+            _sharedPropertyBlock.SetColor(BaseColorPropertyId, chosenColor);
+            _sharedPropertyBlock.SetColor(LegacyColorPropertyId, chosenColor);
+
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                renderers[i].SetPropertyBlock(_sharedPropertyBlock);
+            }
+        }
+
+        private static void EnableGpuInstancingOnHierarchy(GameObject root)
+        {
+            MeshRenderer[] renderers = root.GetComponentsInChildren<MeshRenderer>(true);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                EnableGpuInstancingOnRenderer(renderers[i]);
+            }
+        }
+
+        private static void EnableGpuInstancingOnRenderer(MeshRenderer renderer)
+        {
+            if (renderer == null)
+            {
+                return;
+            }
+
+            Material[] sharedMaterials = renderer.sharedMaterials;
+            for (int i = 0; i < sharedMaterials.Length; i++)
+            {
+                Material mat = sharedMaterials[i];
+                if (mat != null && !mat.enableInstancing)
+                {
+                    mat.enableInstancing = true;
+                }
+            }
+        }
+
+        #endregion
+
+        #region Procedural Low-Poly Stand-In Prototypes (Immediate Zero-Asset Testing)
+
+        private GameObject BuildProceduralPrototype(string typeName)
+        {
+            var root = new GameObject($"Template_{typeName}");
+            root.transform.SetParent(_templatesRoot, false);
+
+            if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Building") ||
+                SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "House"))
+            {
+                // Indian low-poly house/shop: main block (primary renderer) + rooftop parapet ledge
+                Material wallMat = CreateTrackedMaterial("Asoda_BuildingWall_Mat", new Color(0.88f, 0.75f, 0.56f, 1f));
+                Material roofMat = CreateTrackedMaterial("Asoda_BuildingRoof_Mat", new Color(0.58f, 0.34f, 0.25f, 1f));
+
+                CreatePart(root.transform, PrimitiveType.Cube, "Walls", new Vector3(0f, 2.25f, 0f), new Vector3(6.5f, 4.5f, 6.5f), wallMat, keepCollider: true);
+                CreatePart(root.transform, PrimitiveType.Cube, "ParapetRoof", new Vector3(0f, 4.7f, 0f), new Vector3(6.9f, 0.45f, 6.9f), roofMat, keepCollider: false);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Tree"))
+            {
+                // Canopy placed FIRST in hierarchy so primary tintable renderer = foliage canopy!
+                Material canopyMat = CreateTrackedMaterial("Asoda_TreeCanopy_Mat", new Color(0.24f, 0.54f, 0.22f, 1f));
+                Material trunkMat = CreateTrackedMaterial("Asoda_TreeTrunk_Mat", new Color(0.42f, 0.27f, 0.16f, 1f));
+
+                CreatePart(root.transform, PrimitiveType.Sphere, "Canopy", new Vector3(0f, 4.2f, 0f), new Vector3(3.8f, 3.2f, 3.8f), canopyMat, keepCollider: false);
+                CreatePart(root.transform, PrimitiveType.Cylinder, "Trunk", new Vector3(0f, 1.4f, 0f), new Vector3(0.55f, 1.4f, 0.55f), trunkMat, keepCollider: true);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Mandir"))
+            {
+                // Traditional Indian Mandir silhouette: raised jagati plinth + garbhagriha + stepped shikhara spire
+                Material stoneMat = CreateTrackedMaterial("Asoda_MandirStone_Mat", new Color(0.92f, 0.62f, 0.28f, 1f));
+                Material plinthMat = CreateTrackedMaterial("Asoda_MandirPlinth_Mat", new Color(0.76f, 0.62f, 0.46f, 1f));
+                Material kalashMat = CreateTrackedMaterial("Asoda_MandirKalash_Mat", new Color(0.95f, 0.80f, 0.22f, 1f));
+
+                CreatePart(root.transform, PrimitiveType.Cube, "Garbhagriha", new Vector3(0f, 3.0f, 0f), new Vector3(6.0f, 4.0f, 6.0f), stoneMat, keepCollider: true);
+                CreatePart(root.transform, PrimitiveType.Cube, "JagatiPlinth", new Vector3(0f, 0.5f, 0f), new Vector3(9.0f, 1.0f, 9.0f), plinthMat, keepCollider: true);
+                CreatePart(root.transform, PrimitiveType.Cube, "ShikharaTier1", new Vector3(0f, 6.0f, 0f), new Vector3(4.2f, 2.2f, 4.2f), stoneMat, keepCollider: false);
+                CreatePart(root.transform, PrimitiveType.Cube, "ShikharaTier2", new Vector3(0f, 8.0f, 0f), new Vector3(2.5f, 2.0f, 2.5f), stoneMat, keepCollider: false);
+                CreatePart(root.transform, PrimitiveType.Sphere, "Kalash", new Vector3(0f, 9.5f, 0f), new Vector3(1.1f, 1.3f, 1.1f), kalashMat, keepCollider: false);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Vehicle"))
+            {
+                // Compact Indian auto-rickshaw / utility vehicle silhouette
+                Material bodyMat = CreateTrackedMaterial("Asoda_VehicleBody_Mat", new Color(0.16f, 0.56f, 0.29f, 1f));
+                Material canopyMat = CreateTrackedMaterial("Asoda_VehicleTop_Mat", new Color(0.92f, 0.78f, 0.18f, 1f));
+
+                CreatePart(root.transform, PrimitiveType.Cube, "Chassis", new Vector3(0f, 0.65f, 0f), new Vector3(1.7f, 0.9f, 3.1f), bodyMat, keepCollider: true);
+                CreatePart(root.transform, PrimitiveType.Cube, "Canopy", new Vector3(0f, 1.45f, -0.15f), new Vector3(1.6f, 0.75f, 2.2f), canopyMat, keepCollider: false);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Lake"))
+            {
+                // 2-triangle water surface quad raised slightly above ground (-0.02 -> +0.04) to prevent Z-fighting
+                Material waterMat = CreateTrackedMaterial("Asoda_LakeWater_Mat", new Color(0.16f, 0.49f, 0.64f, 1f));
+                GameObject waterQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                waterQuad.name = "WaterSurface";
+                Collider col = waterQuad.GetComponent<Collider>();
+                if (col != null)
+                {
+                    Object.Destroy(col);
+                }
+
+                Transform t = waterQuad.transform;
+                t.SetParent(root.transform, false);
+                t.localPosition = new Vector3(0f, 0.04f, 0f);
+                t.localRotation = Quaternion.Euler(90f, 0f, 0f);
+                t.localScale = new Vector3(12f, 12f, 1f);
+
+                MeshRenderer mr = waterQuad.GetComponent<MeshRenderer>();
+                mr.sharedMaterial = waterMat;
+                mr.shadowCastingMode = ShadowCastingMode.Off;
+            }
+            else
+            {
+                Material propMat = CreateTrackedMaterial($"Asoda_{typeName}_Mat", new Color(0.75f, 0.70f, 0.62f, 1f));
+                CreatePart(root.transform, PrimitiveType.Cube, "Mesh", new Vector3(0f, 1.0f, 0f), new Vector3(2.0f, 2.0f, 2.0f), propMat, keepCollider: true);
+            }
+
+            root.SetActive(false);
+            return root;
+        }
+
+        private static void CreatePart(
+            Transform parent,
+            PrimitiveType primitiveType,
+            string partName,
+            Vector3 localPosition,
+            Vector3 localScale,
+            Material sharedMaterial,
+            bool keepCollider)
+        {
+            GameObject part = GameObject.CreatePrimitive(primitiveType);
+            part.name = partName;
+
+            if (!keepCollider)
+            {
+                Collider col = part.GetComponent<Collider>();
+                if (col != null)
+                {
+                    Object.Destroy(col);
+                }
+            }
+
+            Transform t = part.transform;
+            t.SetParent(parent, false);
+            t.localPosition = localPosition;
+            t.localRotation = Quaternion.identity;
+            t.localScale = localScale;
+
+            MeshRenderer mr = part.GetComponent<MeshRenderer>();
+            mr.sharedMaterial = sharedMaterial;
+        }
+
+        private Material CreateTrackedMaterial(string name, Color color)
+        {
+            Material mat = ChunkPool.CreateInstancedSurfaceMaterial(name, color);
+            _runtimeMaterials.Add(mat);
+            return mat;
+        }
+
+        #endregion
+
+        #region File & Resource Loading
+
+        private static string TryReadMapJsonText()
+        {
+            // 1. Check persistentDataPath override (writable on both Android and Desktop)
+            string persistentPath = Path.Combine(Application.persistentDataPath, "map_data.json");
+            if (File.Exists(persistentPath))
+            {
+                return File.ReadAllText(persistentPath);
+            }
+
+            // 2. Check Unity Resources (Assets/_Project/Resources/map_data.json -> packed into Android APK/AAB)
+            TextAsset resourceAsset = Resources.Load<TextAsset>(DefaultResourceName);
+            if (resourceAsset != null && !string.IsNullOrEmpty(resourceAsset.text))
+            {
+                return resourceAsset.text;
+            }
+
+#if !UNITY_ANDROID || UNITY_EDITOR
+            // 3. Check StreamingAssets on Editor/Desktop
+            string streamingPath = Path.Combine(Application.streamingAssetsPath, "map_data.json");
+            if (File.Exists(streamingPath))
+            {
+                return File.ReadAllText(streamingPath);
+            }
+#endif
+
+            return null;
+        }
+
+        #endregion
+    }
+}
