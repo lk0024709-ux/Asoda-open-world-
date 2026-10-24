@@ -13,8 +13,8 @@ namespace Asoda.World
     public sealed class WorldChunkManager : IGameSystem, ITickable
     {
         public const float DefaultChunkSize = 50f;
-        public const int DefaultLoadRadius = 1; // 1 => (2*1 + 1) x (2*1 + 1) = 3x3 active chunks (150m x 150m)
-        public const int DefaultMaxChunkLoadsPerTick = 3;
+        public const int DefaultLoadRadius = 3; // 3 * 50m = 150m streaming radius around the player
+        public const int DefaultMaxChunkLoadsPerTick = 4;
         private const float TargetLookupIntervalSeconds = 0.5f;
 
         /// <summary>
@@ -84,6 +84,17 @@ namespace Asoda.World
 
         public event Action<ChunkCoord> OnChunkLoaded;
         public event Action<ChunkCoord> OnChunkUnloaded;
+
+        /// <summary>
+        /// Invoked with the live <see cref="WorldChunk"/> immediately after its props are populated.
+        /// Used by <see cref="StaticMeshCombiner"/> to merge static chunk geometry.
+        /// </summary>
+        public event Action<WorldChunk> OnChunkLoadedChunk;
+
+        /// <summary>
+        /// Invoked with the live <see cref="WorldChunk"/> right before its props are cleared back to pools.
+        /// </summary>
+        public event Action<WorldChunk> OnChunkUnloadingChunk;
 
         public WorldChunkManager(
             MapDataLoader mapDataLoader = null,
@@ -175,6 +186,7 @@ namespace Asoda.World
 
             foreach (KeyValuePair<ChunkCoord, WorldChunk> pair in _activeChunks)
             {
+                OnChunkUnloadingChunk?.Invoke(pair.Value);
                 _mapDataLoader.ClearChunk(pair.Value);
                 _chunkPool.Release(pair.Value);
             }
@@ -299,6 +311,7 @@ namespace Asoda.World
             WorldChunk chunk = _chunkPool.Acquire(coord);
             _mapDataLoader.PopulateChunk(chunk);
             _activeChunks[coord] = chunk;
+            OnChunkLoadedChunk?.Invoke(chunk);
             OnChunkLoaded?.Invoke(coord);
         }
 
@@ -310,6 +323,7 @@ namespace Asoda.World
             }
 
             _activeChunks.Remove(coord);
+            OnChunkUnloadingChunk?.Invoke(chunk);
             _mapDataLoader.ClearChunk(chunk);
             _chunkPool.Release(chunk);
             OnChunkUnloaded?.Invoke(coord);

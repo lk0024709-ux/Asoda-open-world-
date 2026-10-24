@@ -1,12 +1,14 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
+using Object = UnityEngine.Object;
 
 namespace Asoda.World
 {
     /// <summary>
-    /// Cached wrapper around a pooled prop GameObject and its renderers so chunk streaming
-    /// never calls GetComponentsInChildren or allocates memory during gameplay.
+    /// Cached wrapper around a pooled prop GameObject, its tintable renderers, and its static-batchable
+    /// mesh components so chunk streaming and <see cref="StaticMeshCombiner"/> never call GetComponent during gameplay.
     /// </summary>
     public sealed class PooledPropInstance
     {
@@ -14,18 +16,46 @@ namespace Asoda.World
         public readonly GameObject GameObject;
         public readonly Transform Transform;
         public readonly MeshRenderer[] Renderers;
+        public readonly bool IsStaticBatchable;
+        public readonly MeshFilter[] StaticMeshFilters;
+        public readonly MeshRenderer[] StaticMeshRenderers;
 
-        public PooledPropInstance(ushort assetTypeId, GameObject gameObject, MeshRenderer[] renderers)
+        public PooledPropInstance(
+            ushort assetTypeId,
+            GameObject gameObject,
+            MeshRenderer[] tintRenderers,
+            bool isStaticBatchable,
+            MeshFilter[] staticMeshFilters,
+            MeshRenderer[] staticMeshRenderers)
         {
             AssetTypeId = assetTypeId;
             GameObject = gameObject;
             Transform = gameObject.transform;
-            Renderers = renderers;
+            Renderers = tintRenderers ?? Array.Empty<MeshRenderer>();
+            IsStaticBatchable = isStaticBatchable;
+            StaticMeshFilters = staticMeshFilters ?? Array.Empty<MeshFilter>();
+            StaticMeshRenderers = staticMeshRenderers ?? Array.Empty<MeshRenderer>();
+        }
+
+        /// <summary>
+        /// Re-enables individual MeshRenderers that were hidden while merged into a chunk's combined static mesh.
+        /// </summary>
+        public void RestoreStaticRenderers()
+        {
+            for (int i = 0; i < StaticMeshRenderers.Length; i++)
+            {
+                MeshRenderer r = StaticMeshRenderers[i];
+                if (r != null && !r.enabled)
+                {
+                    r.enabled = true;
+                }
+            }
         }
     }
 
     /// <summary>
     /// Represents a single reusable 50x50 world chunk container managed by <see cref="ChunkPool"/>.
+    /// Includes a persistent combined static mesh slot for <see cref="StaticMeshCombiner"/>.
     /// </summary>
     public sealed class WorldChunk
     {
@@ -33,18 +63,31 @@ namespace Asoda.World
         public readonly GameObject RootGameObject;
         public readonly Transform RootTransform;
         public readonly MeshRenderer GroundRenderer;
+        public readonly MeshFilter CombinedStaticMeshFilter;
+        public readonly MeshRenderer CombinedStaticMeshRenderer;
+        public readonly Mesh CombinedStaticMesh;
         public readonly List<PooledPropInstance> SpawnedProps = new List<PooledPropInstance>(64);
 
         public ChunkCoord Coord { get; private set; }
         public ChunkBounds Bounds { get; private set; }
         public bool IsActive { get; private set; }
+        public bool HasCombinedStaticMesh { get; internal set; }
 
-        public WorldChunk(int poolId, GameObject rootGameObject, MeshRenderer groundRenderer)
+        public WorldChunk(
+            int poolId,
+            GameObject rootGameObject,
+            MeshRenderer groundRenderer,
+            MeshFilter combinedMeshFilter,
+            MeshRenderer combinedMeshRenderer,
+            Mesh combinedMesh)
         {
             PoolId = poolId;
             RootGameObject = rootGameObject;
             RootTransform = rootGameObject.transform;
             GroundRenderer = groundRenderer;
+            CombinedStaticMeshFilter = combinedMeshFilter;
+            CombinedStaticMeshRenderer = combinedMeshRenderer;
+            CombinedStaticMesh = combinedMesh;
         }
 
         internal void Activate(ChunkCoord coord, float chunkSize, Transform activeParent, MaterialPropertyBlock propertyBlock, int baseColorId, int legacyColorId)
@@ -52,6 +95,12 @@ namespace Asoda.World
             Coord = coord;
             Bounds = coord.GetBounds(chunkSize);
             IsActive = true;
+            HasCombinedStaticMesh = false;
+
+            if (CombinedStaticMeshRenderer != null)
+            {
+                CombinedStaticMeshRenderer.enabled = false;
+            }
 
             RootTransform.SetParent(activeParent, false);
             RootTransform.localPosition = coord.GetWorldOrigin(chunkSize);
@@ -64,7 +113,6 @@ namespace Asoda.World
 
             if (GroundRenderer != null && propertyBlock != null)
             {
-                // Subtle deterministic dry-earth / rural grass variation per chunk using GPU Instancing
                 int hash = unchecked((coord.X * 92837111) ^ (coord.Z * 689287499));
                 float t = ((hash & 0xFF) / 255f);
                 Color groundTint = Color.Lerp(
@@ -84,7 +132,19 @@ namespace Asoda.World
         internal void Deactivate(Transform poolParent)
         {
             IsActive = false;
+            HasCombinedStaticMesh = false;
             SpawnedProps.Clear();
+
+            if (CombinedStaticMesh != null)
+            {
+                CombinedStaticMesh.Clear(false);
+            }
+
+            if (CombinedStaticMeshRenderer != null)
+            {
+                CombinedStaticMeshRenderer.enabled = false;
+            }
+
             if (RootGameObject != null)
             {
                 RootGameObject.SetActive(false);
@@ -99,7 +159,7 @@ namespace Asoda.World
 
     /// <summary>
     /// Pre-warmed object pool for chunk root GameObjects.
-    /// Reuses chunk containers across coordinate transitions to eliminate Instantiate/Destroy GC spikes on Android.
+    /// Reuses chunk containers and combined static meshes across coordinate transitions to prevent GC spikes on mobile.
     /// </summary>
     public sealed class ChunkPool
     {
@@ -153,9 +213,6 @@ namespace Asoda.World
             Prewarm(initialCapacity);
         }
 
-        /// <summary>
-        /// Pre-allocates chunk root GameObjects at startup so runtime chunk streaming never allocates chunk roots.
-        /// </summary>
         public void Prewarm(int targetCount)
         {
             while (_allChunks.Count < targetCount)
@@ -165,9 +222,6 @@ namespace Asoda.World
             }
         }
 
-        /// <summary>
-        /// Acquires a pooled chunk root, positions it at the target grid coordinate, and activates it.
-        /// </summary>
         public WorldChunk Acquire(ChunkCoord coord)
         {
             WorldChunk chunk = _availableChunks.Count > 0 ? _availableChunks.Pop() : CreatePooledChunk();
@@ -175,9 +229,6 @@ namespace Asoda.World
             return chunk;
         }
 
-        /// <summary>
-        /// Deactivates a chunk root and returns it to the reusable pool without destroying its GameObject.
-        /// </summary>
         public void Release(WorldChunk chunk)
         {
             if (chunk == null || !chunk.IsActive)
@@ -189,11 +240,16 @@ namespace Asoda.World
             _availableChunks.Push(chunk);
         }
 
-        /// <summary>
-        /// Releases native Unity objects only when the entire game shuts down.
-        /// </summary>
         public void Dispose()
         {
+            for (int i = 0; i < _allChunks.Count; i++)
+            {
+                if (_allChunks[i].CombinedStaticMesh != null)
+                {
+                    Object.Destroy(_allChunks[i].CombinedStaticMesh);
+                }
+            }
+
             _availableChunks.Clear();
             _allChunks.Clear();
 
@@ -229,7 +285,6 @@ namespace Asoda.World
             MeshRenderer groundRenderer = null;
             if (_createGroundTiles)
             {
-                // Shared 2-triangle XZ mesh constructed directly without Instantiate or temporary colliders
                 var groundGo = new GameObject("GroundTile");
                 Transform groundTransform = groundGo.transform;
                 groundTransform.SetParent(rootTransform, false);
@@ -244,9 +299,27 @@ namespace Asoda.World
                 groundRenderer.receiveShadows = true;
             }
 
+            // Persistent combined static mesh holder per chunk (reused across chunk unloads/loads)
+            var combinedGo = new GameObject("CombinedStaticMesh");
+            combinedGo.transform.SetParent(rootTransform, false);
+
+            var combinedMesh = new Mesh
+            {
+                name = $"ChunkCombinedStatic_{poolId:D2}"
+            };
+            combinedMesh.MarkDynamic();
+
+            var combinedFilter = combinedGo.AddComponent<MeshFilter>();
+            combinedFilter.sharedMesh = combinedMesh;
+
+            var combinedRenderer = combinedGo.AddComponent<MeshRenderer>();
+            combinedRenderer.shadowCastingMode = ShadowCastingMode.On;
+            combinedRenderer.receiveShadows = true;
+            combinedRenderer.enabled = false;
+
             rootGo.SetActive(false);
 
-            var chunk = new WorldChunk(poolId, rootGo, groundRenderer);
+            var chunk = new WorldChunk(poolId, rootGo, groundRenderer, combinedFilter, combinedRenderer, combinedMesh);
             _allChunks.Add(chunk);
             return chunk;
         }
@@ -268,10 +341,7 @@ namespace Asoda.World
 
             mesh.normals = new[]
             {
-                Vector3.up,
-                Vector3.up,
-                Vector3.up,
-                Vector3.up
+                Vector3.up, Vector3.up, Vector3.up, Vector3.up
             };
 
             mesh.uv = new[]
@@ -283,6 +353,77 @@ namespace Asoda.World
             };
 
             mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        /// <summary>
+        /// Builds a guaranteed CPU-readable (isReadable == true) 24-vertex unit box mesh [-0.5..0.5]^3
+        /// so Mesh.CombineMeshes always succeeds in stripped Android IL2CPP builds.
+        /// </summary>
+        internal static Mesh CreateReadableUnitBoxMesh()
+        {
+            var mesh = new Mesh
+            {
+                name = "Asoda_ReadableUnitBox"
+            };
+
+            mesh.vertices = new[]
+            {
+                // Top (+Y)
+                new Vector3(-0.5f,  0.5f, -0.5f), new Vector3(-0.5f,  0.5f,  0.5f),
+                new Vector3( 0.5f,  0.5f,  0.5f), new Vector3( 0.5f,  0.5f, -0.5f),
+                // Bottom (-Y)
+                new Vector3(-0.5f, -0.5f,  0.5f), new Vector3(-0.5f, -0.5f, -0.5f),
+                new Vector3( 0.5f, -0.5f, -0.5f), new Vector3( 0.5f, -0.5f,  0.5f),
+                // Back (-Z)
+                new Vector3(-0.5f, -0.5f, -0.5f), new Vector3(-0.5f,  0.5f, -0.5f),
+                new Vector3( 0.5f,  0.5f, -0.5f), new Vector3( 0.5f, -0.5f, -0.5f),
+                // Front (+Z)
+                new Vector3( 0.5f, -0.5f,  0.5f), new Vector3( 0.5f,  0.5f,  0.5f),
+                new Vector3(-0.5f,  0.5f,  0.5f), new Vector3(-0.5f, -0.5f,  0.5f),
+                // Right (+X)
+                new Vector3( 0.5f, -0.5f, -0.5f), new Vector3( 0.5f,  0.5f, -0.5f),
+                new Vector3( 0.5f,  0.5f,  0.5f), new Vector3( 0.5f, -0.5f,  0.5f),
+                // Left (-X)
+                new Vector3(-0.5f, -0.5f,  0.5f), new Vector3(-0.5f,  0.5f,  0.5f),
+                new Vector3(-0.5f,  0.5f, -0.5f), new Vector3(-0.5f, -0.5f, -0.5f)
+            };
+
+            mesh.normals = new[]
+            {
+                Vector3.up, Vector3.up, Vector3.up, Vector3.up,
+                Vector3.down, Vector3.down, Vector3.down, Vector3.down,
+                Vector3.back, Vector3.back, Vector3.back, Vector3.back,
+                Vector3.forward, Vector3.forward, Vector3.forward, Vector3.forward,
+                Vector3.right, Vector3.right, Vector3.right, Vector3.right,
+                Vector3.left, Vector3.left, Vector3.left, Vector3.left
+            };
+
+            var uvs = new Vector2[24];
+            for (int f = 0; f < 6; f++)
+            {
+                int b = f * 4;
+                uvs[b + 0] = new Vector2(0f, 0f);
+                uvs[b + 1] = new Vector2(0f, 1f);
+                uvs[b + 2] = new Vector2(1f, 1f);
+                uvs[b + 3] = new Vector2(1f, 0f);
+            }
+            mesh.uv = uvs;
+
+            var tris = new int[36];
+            for (int f = 0; f < 6; f++)
+            {
+                int b = f * 4;
+                int t = f * 6;
+                tris[t + 0] = b + 0;
+                tris[t + 1] = b + 1;
+                tris[t + 2] = b + 2;
+                tris[t + 3] = b + 0;
+                tris[t + 4] = b + 2;
+                tris[t + 5] = b + 3;
+            }
+            mesh.triangles = tris;
             mesh.RecalculateBounds();
             return mesh;
         }
@@ -307,7 +448,6 @@ namespace Asoda.World
                 material.SetColor(LegacyColorPropertyId, baseColor);
             }
 
-            // Reduce specular glare for stylized low-poly look across URP and Built-in RP
             int smoothnessId = Shader.PropertyToID("_Smoothness");
             if (material.HasProperty(smoothnessId))
             {
@@ -349,7 +489,6 @@ namespace Asoda.World
                 return shader;
             }
 
-            // Ultimate build-safe fallback: extract Unity's built-in primitive shader
             GameObject tempPrimitive = GameObject.CreatePrimitive(PrimitiveType.Quad);
             Shader fallbackShader = tempPrimitive.GetComponent<MeshRenderer>().sharedMaterial.shader;
             Object.Destroy(tempPrimitive);

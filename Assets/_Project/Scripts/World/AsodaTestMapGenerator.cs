@@ -109,23 +109,32 @@ namespace Asoda.World
             GenerateBuildingBlock(sb, ref first, rng, minX: 78f, maxX: 126f, minZ: -64f, maxZ: -18f, step: 14.0f);
             GenerateBuildingBlock(sb, ref first, rng, minX: 32f, maxX: 118f, minZ: -120f, maxZ: -78f, step: 15.0f);
 
-            // 4. Roadside Vehicles along main N-S (X = 0) and E-W (Z = 0) village roads
+            // 4. Static Village Roads & Roadside Vehicles along main N-S (X = 0) and E-W (Z = 0) crossroads
+            for (float rPos = -170f; rPos <= 170f; rPos += 12f)
+            {
+                AppendEntry(sb, ref first, "Road", rPos, 0f, 90f, 1.0f, 0);
+                if (Mathf.Abs(rPos) > 8f)
+                {
+                    AppendEntry(sb, ref first, "Road", 0f, rPos, 0f, 1.0f, 0);
+                }
+            }
+
             float[] roadPositions = { -135f, -95f, -55f, -24f, 22f, 58f, 96f, 138f };
             for (int i = 0; i < roadPositions.Length; i++)
             {
                 float pos = roadPositions[i];
                 // East-West road lanes
-                AppendEntry(sb, ref first, "Vehicle", pos, -3.5f, 90f, 1.0f, i % 4);
+                AppendEntry(sb, ref first, "Vehicle", pos, -3.2f, 90f, 1.0f, i % 6);
                 if ((i & 1) == 0)
                 {
-                    AppendEntry(sb, ref first, "Vehicle", pos + 8f, 3.5f, 270f, 1.0f, (i + 1) % 4);
+                    AppendEntry(sb, ref first, "Vehicle", pos + 8f, 3.2f, 270f, 1.0f, (i + 1) % 6);
                 }
 
                 // North-South road lanes
-                AppendEntry(sb, ref first, "Vehicle", 3.5f, pos, 0f, 1.0f, (i + 2) % 4);
+                AppendEntry(sb, ref first, "Vehicle", 3.2f, pos, 0f, 1.0f, (i + 2) % 6);
                 if ((i & 1) == 1)
                 {
-                    AppendEntry(sb, ref first, "Vehicle", -3.5f, pos - 7f, 180f, 1.0f, (i + 3) % 4);
+                    AppendEntry(sb, ref first, "Vehicle", -3.2f, pos - 7f, 180f, 1.0f, (i + 3) % 6);
                 }
             }
 
@@ -374,13 +383,13 @@ namespace Asoda.World
                 Object.DontDestroyOnLoad(_createdCameraGo);
 
                 mainCam = _createdCameraGo.AddComponent<Camera>();
-                mainCam.clearFlags = CameraClearFlags.SolidColor;
-                mainCam.backgroundColor = new Color(0.68f, 0.84f, 0.95f, 1f);
+                mainCam.clearFlags = CameraClearFlags.Skybox;
+                mainCam.backgroundColor = new Color(0.92f, 0.64f, 0.43f, 1f);
                 mainCam.nearClipPlane = 0.5f;
-                mainCam.farClipPlane = 260f;
+                mainCam.farClipPlane = 160f;
 
-                _createdCameraGo.transform.position = new Vector3(0f, 42f, -38f);
-                _createdCameraGo.transform.rotation = Quaternion.Euler(44f, 0f, 0f);
+                _createdCameraGo.transform.position = new Vector3(0f, 22f, -28f);
+                _createdCameraGo.transform.rotation = Quaternion.Euler(24f, 0f, 0f);
             }
 
             _previewCameraTransform = mainCam.transform;
@@ -397,11 +406,11 @@ namespace Asoda.World
 
                 var sun = _createdLightGo.AddComponent<Light>();
                 sun.type = LightType.Directional;
-                sun.color = new Color(1.0f, 0.95f, 0.84f, 1f);
-                sun.intensity = 1.15f;
+                sun.color = new Color(1.0f, 0.86f, 0.62f, 1f);
+                sun.intensity = 1.12f;
                 sun.shadows = LightShadows.Soft;
 
-                _createdLightGo.transform.rotation = Quaternion.Euler(48f, -36f, 0f);
+                _createdLightGo.transform.rotation = Quaternion.Euler(18f, -25f, 0f);
             }
         }
 
