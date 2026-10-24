@@ -9,6 +9,53 @@ using Object = UnityEngine.Object;
 namespace Asoda.World
 {
     /// <summary>
+    /// Categories of world entities displayed as colored UI dots on the circular minimap.
+    /// </summary>
+    public enum MinimapBlipCategory : byte
+    {
+        Building = 0,
+        Mandir = 1,
+        Vehicle = 2,
+        Mission = 3
+    }
+
+    /// <summary>
+    /// Lightweight value-type blip entry for zero-allocation minimap rendering.
+    /// </summary>
+    public readonly struct MinimapBlipData
+    {
+        public readonly float WorldX;
+        public readonly float WorldZ;
+        public readonly MinimapBlipCategory Category;
+
+        public Vector3 WorldPosition => new Vector3(WorldX, 0f, WorldZ);
+
+        public MinimapBlipData(float worldX, float worldZ, MinimapBlipCategory category)
+        {
+            WorldX = worldX;
+            WorldZ = worldZ;
+            Category = category;
+        }
+
+        public MinimapBlipData(Vector3 worldPosition, MinimapBlipCategory category)
+        {
+            WorldX = worldPosition.x;
+            WorldZ = worldPosition.z;
+            Category = category;
+        }
+    }
+
+    /// <summary>
+    /// Marker component attached to root Vehicle GameObjects so Physics.OverlapSphere on child colliders
+    /// resolves the root vehicle cleanly alongside the "Vehicle" tag.
+    /// </summary>
+    public sealed class DrivableVehicleMarker : MonoBehaviour
+    {
+        public PooledPropInstance SourcePropInstance;
+        public Collider[] ParkedColliders;
+    }
+
+    /// <summary>
     /// Compact 24-byte value-type placement record parsed from map_data.json.
     /// Contains zero managed references to avoid GC pressure on large maps.
     /// </summary>
@@ -43,6 +90,7 @@ namespace Asoda.World
     {
         public const string DefaultResourceName = "map_data";
         public const string PrefabResourceFolder = "Prefabs/";
+        public const string VehicleTagName = "Vehicle";
 
         private sealed class AssetTypeSlot
         {
@@ -70,8 +118,48 @@ namespace Asoda.World
         private Transform _pooledPropsRoot;
         private int _totalObjectCount;
 
+        private ushort _buildingTypeId;
+        private ushort _houseTypeId;
+        private ushort _mandirTypeId;
+        private ushort _vehicleTypeId;
+        private bool _vehicleTagVerified;
+        private bool _vehicleTagSupported;
+
         public int TotalObjectCount => _totalObjectCount;
         public int PopulatedChunkCount => _chunkBuckets.Count;
+
+#if UNITY_EDITOR
+        [UnityEditor.InitializeOnLoadMethod]
+        private static void EnsureCustomProjectTagsInEditor()
+        {
+            Object[] tagAssets = UnityEditor.AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/TagManager.asset");
+            if (tagAssets == null || tagAssets.Length == 0)
+            {
+                return;
+            }
+
+            var tagManager = new UnityEditor.SerializedObject(tagAssets[0]);
+            UnityEditor.SerializedProperty tagsProp = tagManager.FindProperty("tags");
+            if (tagsProp == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < tagsProp.arraySize; i++)
+            {
+                UnityEditor.SerializedProperty entry = tagsProp.GetArrayElementAtIndex(i);
+                if (entry != null && entry.stringValue == "Vehicle")
+                {
+                    return;
+                }
+            }
+
+            int insertIdx = tagsProp.arraySize;
+            tagsProp.InsertArrayElementAtIndex(insertIdx);
+            tagsProp.GetArrayElementAtIndex(insertIdx).stringValue = "Vehicle";
+            tagManager.ApplyModifiedPropertiesWithoutUndo();
+        }
+#endif
 
         public MapDataLoader(float chunkSize = WorldChunkManager.DefaultChunkSize)
         {
@@ -775,7 +863,7 @@ namespace Asoda.World
         private void PreRegisterCoreAssetTypes()
         {
             // Static architectural & road assets (merged per-chunk via StaticMeshCombiner)
-            RegisterAssetSlot("Building", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
+            _buildingTypeId = RegisterAssetSlot("Building", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
                 new Color(0.89f, 0.76f, 0.58f, 1f),
                 new Color(0.84f, 0.56f, 0.42f, 1f),
@@ -794,10 +882,10 @@ namespace Asoda.World
             });
 
             // Dynamic LOD + MaterialPropertyBlock Vehicles (auto-rickshaws, tractors, cars)
-            RegisterAssetSlot("Vehicle", isStaticBatchable: false, isVehicle: true, isWeapon: false, palette: MaterialVariantApplier.VehicleBodyPalette);
+            _vehicleTypeId = RegisterAssetSlot("Vehicle", isStaticBatchable: false, isVehicle: true, isWeapon: false, palette: MaterialVariantApplier.VehicleBodyPalette);
 
             // Static sacred Mandir architecture
-            RegisterAssetSlot("Mandir", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
+            _mandirTypeId = RegisterAssetSlot("Mandir", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
                 new Color(0.93f, 0.62f, 0.28f, 1f),
                 new Color(0.90f, 0.74f, 0.52f, 1f)
@@ -810,7 +898,7 @@ namespace Asoda.World
                 new Color(0.20f, 0.54f, 0.68f, 1f)
             });
 
-            RegisterAssetSlot("House", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
+            _houseTypeId = RegisterAssetSlot("House", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
                 new Color(0.88f, 0.74f, 0.56f, 1f),
                 new Color(0.85f, 0.60f, 0.46f, 1f),
@@ -968,14 +1056,105 @@ namespace Asoda.World
                 staticRenderers = validRenderers.ToArray();
             }
 
-            return new PooledPropInstance(
+            var pooledInstance = new PooledPropInstance(
                 slot.Id,
                 instanceGo,
                 tintRenderers,
                 canStaticBatch,
                 staticFilters,
                 staticRenderers);
+
+            if (slot.IsVehicle)
+            {
+                PrepareVehicleInstanceMetadata(instanceGo, pooledInstance);
+            }
+
+            return pooledInstance;
         }
+
+        private void PrepareVehicleInstanceMetadata(GameObject vehicleGo, PooledPropInstance pooledInstance)
+        {
+            TryAssignVehicleTagRecursively(vehicleGo);
+
+            DrivableVehicleMarker marker = vehicleGo.GetComponent<DrivableVehicleMarker>();
+            if (marker == null)
+            {
+                marker = vehicleGo.AddComponent<DrivableVehicleMarker>();
+            }
+
+            marker.SourcePropInstance = pooledInstance;
+            marker.ParkedColliders = vehicleGo.GetComponentsInChildren<Collider>(true);
+        }
+
+        private void TryAssignVehicleTagRecursively(GameObject root)
+        {
+            if (!_vehicleTagVerified)
+            {
+                _vehicleTagVerified = true;
+                try
+                {
+                    root.tag = "Vehicle";
+                    _vehicleTagSupported = true;
+                }
+                catch
+                {
+                    _vehicleTagSupported = false;
+                }
+            }
+
+            if (!_vehicleTagSupported)
+            {
+                return;
+            }
+
+            root.tag = "Vehicle";
+            Transform t = root.transform;
+            int count = t.childCount;
+            for (int i = 0; i < count; i++)
+            {
+                TryAssignVehicleTagRecursively(t.GetChild(i).gameObject);
+            }
+        }
+
+        /// <summary>
+        /// Appends static Building and Mandir coordinates within <paramref name="coord"/> for zero-allocation minimap rendering.
+        /// </summary>
+        public void AppendStaticMinimapBlips(ChunkCoord coord, Vector3 center, float maxRadiusSq, List<MinimapBlipData> outBlips)
+        {
+            if (!_chunkBuckets.TryGetValue(coord, out List<MapObjectRecord> records))
+            {
+                return;
+            }
+
+            for (int i = 0; i < records.Count; i++)
+            {
+                MapObjectRecord rec = records[i];
+                ushort id = rec.AssetTypeId;
+
+                MinimapBlipCategory cat;
+                if (id == _mandirTypeId)
+                {
+                    cat = MinimapBlipCategory.Mandir;
+                }
+                else if (id == _buildingTypeId || id == _houseTypeId)
+                {
+                    cat = MinimapBlipCategory.Building;
+                }
+                else
+                {
+                    continue;
+                }
+
+                float dx = rec.X - center.x;
+                float dz = rec.Z - center.z;
+                if ((dx * dx) + (dz * dz) <= maxRadiusSq)
+                {
+                    outBlips.Add(new MinimapBlipData(rec.X, rec.Z, cat));
+                }
+            }
+        }
+
+        public bool IsVehicleAssetType(ushort assetTypeId) => assetTypeId == _vehicleTypeId;
 
         private static void ConfigureLodIfDynamicAsset(AssetTypeSlot slot, GameObject target)
         {

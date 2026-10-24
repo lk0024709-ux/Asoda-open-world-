@@ -238,6 +238,80 @@ namespace Asoda.World
             return _activeChunks.TryGetValue(coord, out chunk);
         }
 
+        /// <summary>
+        /// Detaches a spawned prop (such as a player-claimed Vehicle) from its origin chunk so chunk unloading
+        /// never despawns an actively driven vehicle.
+        /// </summary>
+        public bool DetachPropFromActiveChunks(GameObject propRoot)
+        {
+            if (propRoot == null)
+            {
+                return false;
+            }
+
+            foreach (KeyValuePair<ChunkCoord, WorldChunk> pair in _activeChunks)
+            {
+                List<PooledPropInstance> props = pair.Value.SpawnedProps;
+                for (int i = props.Count - 1; i >= 0; i--)
+                {
+                    if (props[i] != null && props[i].GameObject == propRoot)
+                    {
+                        props.RemoveAt(i);
+                        if (_chunkPool != null && _chunkPool.WorldRootTransform != null)
+                        {
+                            propRoot.transform.SetParent(_chunkPool.WorldRootTransform, worldPositionStays: true);
+                        }
+
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Populates <paramref name="outBlips"/> with nearby Building, Mandir, and live Vehicle positions
+        /// within <paramref name="radarRadius"/> meters without using a second Camera or physics queries.
+        /// </summary>
+        public void CollectNearbyMinimapBlips(Vector3 viewerPos, float radarRadius, List<MinimapBlipData> outBlips)
+        {
+            outBlips.Clear();
+            float maxRadiusSq = radarRadius * radarRadius;
+            int chunkSpan = Mathf.CeilToInt(radarRadius / _chunkSize);
+            ChunkCoord centerCoord = ChunkCoord.FromWorldPosition(viewerPos.x, viewerPos.z, _chunkSize);
+
+            for (int dz = -chunkSpan; dz <= chunkSpan; dz++)
+            {
+                for (int dx = -chunkSpan; dx <= chunkSpan; dx++)
+                {
+                    var coord = new ChunkCoord(centerCoord.X + dx, centerCoord.Z + dz);
+                    _mapDataLoader.AppendStaticMinimapBlips(coord, viewerPos, maxRadiusSq, outBlips);
+
+                    if (_activeChunks.TryGetValue(coord, out WorldChunk chunk))
+                    {
+                        List<PooledPropInstance> spawned = chunk.SpawnedProps;
+                        for (int i = 0; i < spawned.Count; i++)
+                        {
+                            PooledPropInstance prop = spawned[i];
+                            if (prop == null || !_mapDataLoader.IsVehicleAssetType(prop.AssetTypeId) || prop.Transform == null)
+                            {
+                                continue;
+                            }
+
+                            Vector3 vp = prop.Transform.position;
+                            float vx = vp.x - viewerPos.x;
+                            float vz = vp.z - viewerPos.z;
+                            if ((vx * vx) + (vz * vz) <= maxRadiusSq)
+                            {
+                                outBlips.Add(new MinimapBlipData(vp.x, vp.z, MinimapBlipCategory.Vehicle));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         private void RefreshStreamingWindow(ChunkCoord center, Vector2 moveDir)
         {
             _desiredCoords.Clear();
