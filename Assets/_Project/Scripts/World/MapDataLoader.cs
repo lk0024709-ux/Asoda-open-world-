@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Asoda.Utils;
 using UnityEngine;
 using UnityEngine.Rendering;
 using Object = UnityEngine.Object;
@@ -35,16 +36,13 @@ namespace Asoda.World
 
     /// <summary>
     /// High-performance single-pass JSON map loader, spatial chunk bucketer, and GPU-instanced prefab pooler.
-    /// Parses map_data.json with zero substring allocations for coordinates/known types and spawns pooled
-    /// prefabs into active 50x50 chunk boundaries.
+    /// Integrates <see cref="LODGroupSetup"/>, <see cref="MaterialVariantApplier"/>, and static-batch metadata
+    /// for <see cref="StaticMeshCombiner"/>.
     /// </summary>
     public sealed class MapDataLoader
     {
         public const string DefaultResourceName = "map_data";
         public const string PrefabResourceFolder = "Prefabs/";
-
-        private static readonly int BaseColorPropertyId = Shader.PropertyToID("_BaseColor");
-        private static readonly int LegacyColorPropertyId = Shader.PropertyToID("_Color");
 
         private sealed class AssetTypeSlot
         {
@@ -53,6 +51,9 @@ namespace Asoda.World
             public uint NameHash;
             public GameObject Template;
             public bool IsProceduralFallback;
+            public bool IsStaticBatchable;
+            public bool IsVehicle;
+            public bool IsWeapon;
             public Color[] InstancedPalette;
             public readonly Stack<PooledPropInstance> Pool = new Stack<PooledPropInstance>(32);
         }
@@ -62,8 +63,9 @@ namespace Asoda.World
         private readonly List<AssetTypeSlot> _assetTypes = new List<AssetTypeSlot>(16);
         private readonly Dictionary<string, ushort> _customPrefabLookup = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
         private readonly List<Material> _runtimeMaterials = new List<Material>(16);
-        private readonly MaterialPropertyBlock _sharedPropertyBlock = new MaterialPropertyBlock();
 
+        private Mesh _sharedReadableBoxMesh;
+        private Mesh _sharedWaterQuadMesh;
         private Transform _templatesRoot;
         private Transform _pooledPropsRoot;
         private int _totalObjectCount;
@@ -87,6 +89,9 @@ namespace Asoda.World
                 return;
             }
 
+            _sharedReadableBoxMesh = ChunkPool.CreateReadableUnitBoxMesh();
+            _sharedWaterQuadMesh = ChunkPool.CreateHorizontalQuadMesh(1f);
+
             var templatesGo = new GameObject("PrototypeTemplates");
             templatesGo.SetActive(false);
             _templatesRoot = templatesGo.transform;
@@ -98,10 +103,10 @@ namespace Asoda.World
         }
 
         /// <summary>
-        /// Explicitly registers a custom Unity prefab (e.g., imported Blender asset) for an asset type string
-        /// and enables GPU instancing on all shared materials.
+        /// Explicitly registers a custom Unity prefab (e.g., ready-made Blender vehicle, weapon, or building)
+        /// and automatically applies GPU Instancing and 3-tier LODGroup setup where applicable.
         /// </summary>
-        public void RegisterPrefab(string assetType, GameObject prefab)
+        public void RegisterPrefab(string assetType, GameObject prefab, bool? isStaticOverride = null)
         {
             if (string.IsNullOrEmpty(assetType) || prefab == null)
             {
@@ -110,9 +115,16 @@ namespace Asoda.World
 
             ushort id = ResolveOrRegisterAssetType(assetType, 0, assetType.Length);
             AssetTypeSlot slot = _assetTypes[id];
+            if (isStaticOverride.HasValue)
+            {
+                slot.IsStaticBatchable = isStaticOverride.Value;
+            }
+
+            MaterialVariantApplier.EnableGpuInstancing(prefab);
+            ConfigureLodIfDynamicAsset(slot, prefab);
+
             slot.Template = prefab;
             slot.IsProceduralFallback = false;
-            EnableGpuInstancingOnHierarchy(prefab);
         }
 
         /// <summary>
@@ -204,7 +216,7 @@ namespace Asoda.World
         }
 
         /// <summary>
-        /// Pre-warms pooled prop instances per asset type so initial chunk transitions do not spike frame times.
+        /// Pre-warms pooled prop instances per asset type so chunk transitions do not spike frame times.
         /// </summary>
         public void PrewarmPropPools(int countPerCommonType = 24)
         {
@@ -217,7 +229,7 @@ namespace Asoda.World
                     continue;
                 }
 
-                int targetCount = (i <= 1) ? countPerCommonType : Mathf.Max(6, countPerCommonType / 3);
+                int targetCount = (i <= 1 || slot.Name == "Road") ? countPerCommonType : Mathf.Max(6, countPerCommonType / 3);
                 while (slot.Pool.Count < targetCount)
                 {
                     PooledPropInstance instance = CreatePropInstance(slot);
@@ -266,6 +278,7 @@ namespace Asoda.World
                 propTransform.localRotation = Quaternion.Euler(0f, record.RotationY, 0f);
                 propTransform.localScale = Vector3.one * record.Scale;
 
+                instance.RestoreStaticRenderers();
                 ApplyGpuInstancedVariation(instance, record);
 
                 instance.GameObject.SetActive(true);
@@ -295,7 +308,9 @@ namespace Asoda.World
                     continue;
                 }
 
+                instance.RestoreStaticRenderers();
                 instance.GameObject.SetActive(false);
+
                 if (_pooledPropsRoot != null)
                 {
                     instance.Transform.SetParent(_pooledPropsRoot, false);
@@ -308,7 +323,7 @@ namespace Asoda.World
         }
 
         /// <summary>
-        /// Cleans up runtime fallback materials on application shutdown.
+        /// Cleans up runtime fallback materials and meshes on application shutdown.
         /// </summary>
         public void Dispose()
         {
@@ -323,6 +338,18 @@ namespace Asoda.World
             }
 
             _runtimeMaterials.Clear();
+
+            if (_sharedReadableBoxMesh != null)
+            {
+                Object.Destroy(_sharedReadableBoxMesh);
+                _sharedReadableBoxMesh = null;
+            }
+
+            if (_sharedWaterQuadMesh != null)
+            {
+                Object.Destroy(_sharedWaterQuadMesh);
+                _sharedWaterQuadMesh = null;
+            }
         }
 
         #region Fast Single-Pass JSON Parser
@@ -514,7 +541,7 @@ namespace Asoda.World
                 return false;
             }
 
-            cursor++; // skip opening quote
+            cursor++;
             sliceStart = cursor;
 
             while (cursor < length)
@@ -529,7 +556,7 @@ namespace Asoda.World
                 if (c == '"')
                 {
                     sliceLength = cursor - sliceStart;
-                    cursor++; // skip closing quote
+                    cursor++;
                     return true;
                 }
 
@@ -743,57 +770,66 @@ namespace Asoda.World
 
         #endregion
 
-        #region Asset Type Registry, Pooling & GPU Instancing
+        #region Asset Type Registry, LOD, Static Batching & MaterialPropertyBlock
 
         private void PreRegisterCoreAssetTypes()
         {
-            // Repeating Indian town & rural open-world palettes for GPU-instanced MaterialPropertyBlock variation
-            RegisterAssetSlot("Building", new[]
+            // Static architectural & road assets (merged per-chunk via StaticMeshCombiner)
+            RegisterAssetSlot("Building", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
-                new Color(0.89f, 0.76f, 0.58f, 1f), // Warm sandstone ochre
-                new Color(0.84f, 0.56f, 0.42f, 1f), // Terracotta brick
-                new Color(0.92f, 0.89f, 0.82f, 1f), // Sun-washed chunam limewash
-                new Color(0.72f, 0.82f, 0.90f, 1f), // Jodhpur/Rajasthani blue wash
-                new Color(0.88f, 0.79f, 0.50f, 1f)  // Mustard facade
+                new Color(0.89f, 0.76f, 0.58f, 1f),
+                new Color(0.84f, 0.56f, 0.42f, 1f),
+                new Color(0.92f, 0.89f, 0.82f, 1f),
+                new Color(0.72f, 0.82f, 0.90f, 1f),
+                new Color(0.88f, 0.79f, 0.50f, 1f)
             });
 
-            RegisterAssetSlot("Tree", new[]
+            // GPU-instanced repeating foliage
+            RegisterAssetSlot("Tree", isStaticBatchable: false, isVehicle: false, isWeapon: false, palette: new[]
             {
-                new Color(0.24f, 0.54f, 0.22f, 1f), // Neem green
-                new Color(0.19f, 0.46f, 0.20f, 1f), // Deep banyan canopy
-                new Color(0.32f, 0.59f, 0.24f, 1f), // Fresh mango foliage
-                new Color(0.28f, 0.50f, 0.26f, 1f)  // Peepal olive-green
+                new Color(0.24f, 0.54f, 0.22f, 1f),
+                new Color(0.19f, 0.46f, 0.20f, 1f),
+                new Color(0.32f, 0.59f, 0.24f, 1f),
+                new Color(0.28f, 0.50f, 0.26f, 1f)
             });
 
-            RegisterAssetSlot("Vehicle", new[]
+            // Dynamic LOD + MaterialPropertyBlock Vehicles (auto-rickshaws, tractors, cars)
+            RegisterAssetSlot("Vehicle", isStaticBatchable: false, isVehicle: true, isWeapon: false, palette: MaterialVariantApplier.VehicleBodyPalette);
+
+            // Static sacred Mandir architecture
+            RegisterAssetSlot("Mandir", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
-                new Color(0.16f, 0.56f, 0.29f, 1f), // Classic green/yellow auto-rickshaw body
-                new Color(0.84f, 0.65f, 0.16f, 1f), // Yellow taxi/auto
-                new Color(0.78f, 0.25f, 0.22f, 1f), // Red rural tractor/hatchback
-                new Color(0.86f, 0.88f, 0.90f, 1f)  // White utility SUV/van
+                new Color(0.93f, 0.62f, 0.28f, 1f),
+                new Color(0.90f, 0.74f, 0.52f, 1f)
             });
 
-            RegisterAssetSlot("Mandir", new[]
+            // Sarovar water tiles
+            RegisterAssetSlot("Lake", isStaticBatchable: false, isVehicle: false, isWeapon: false, palette: new[]
             {
-                new Color(0.93f, 0.62f, 0.28f, 1f), // Saffron-sandstone shikhara
-                new Color(0.90f, 0.74f, 0.52f, 1f)  // Carved buff sandstone
+                new Color(0.16f, 0.49f, 0.64f, 1f),
+                new Color(0.20f, 0.54f, 0.68f, 1f)
             });
 
-            RegisterAssetSlot("Lake", new[]
-            {
-                new Color(0.16f, 0.49f, 0.64f, 1f), // Deep sarovar water
-                new Color(0.20f, 0.54f, 0.68f, 1f)  // Shallow ghat water
-            });
-
-            RegisterAssetSlot("House", new[]
+            RegisterAssetSlot("House", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: new[]
             {
                 new Color(0.88f, 0.74f, 0.56f, 1f),
                 new Color(0.85f, 0.60f, 0.46f, 1f),
                 new Color(0.91f, 0.88f, 0.80f, 1f)
             });
+
+            // Static village road segments (merged into chunk combined mesh via StaticMeshCombiner)
+            RegisterAssetSlot("Road", isStaticBatchable: true, isVehicle: false, isWeapon: false, palette: null);
+
+            // Dynamic LOD + MaterialPropertyBlock Weapons
+            RegisterAssetSlot("Weapon", isStaticBatchable: false, isVehicle: false, isWeapon: true, palette: MaterialVariantApplier.WeaponFinishPalette);
         }
 
-        private ushort RegisterAssetSlot(string name, Color[] palette)
+        private ushort RegisterAssetSlot(
+            string name,
+            bool isStaticBatchable,
+            bool isVehicle,
+            bool isWeapon,
+            Color[] palette)
         {
             ushort id = (ushort)_assetTypes.Count;
             var slot = new AssetTypeSlot
@@ -801,6 +837,9 @@ namespace Asoda.World
                 Id = id,
                 Name = name,
                 NameHash = ComputeSliceHashIgnoreCase(name, 0, name.Length),
+                IsStaticBatchable = isStaticBatchable,
+                IsVehicle = isVehicle,
+                IsWeapon = isWeapon,
                 InstancedPalette = palette
             };
             _assetTypes.Add(slot);
@@ -821,7 +860,18 @@ namespace Asoda.World
             }
 
             string newTypeName = text.Substring(start, length);
-            return RegisterAssetSlot(newTypeName, null);
+            bool isWeapon = newTypeName.IndexOf("Weapon", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            newTypeName.IndexOf("Gun", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            newTypeName.IndexOf("Rifle", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isVehicle = newTypeName.IndexOf("Vehicle", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             newTypeName.IndexOf("Auto", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             newTypeName.IndexOf("Car", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            Color[] palette = isVehicle
+                ? MaterialVariantApplier.VehicleBodyPalette
+                : (isWeapon ? MaterialVariantApplier.WeaponFinishPalette : null);
+
+            return RegisterAssetSlot(newTypeName, isStaticBatchable: false, isVehicle: isVehicle, isWeapon: isWeapon, palette: palette);
         }
 
         private PooledPropInstance AcquireProp(ushort assetTypeId)
@@ -848,18 +898,18 @@ namespace Asoda.World
                 return;
             }
 
-            // 1. Check project Resources/Prefabs/<AssetName> for imported Blender prefabs
+            // 1. Check project Resources/Prefabs/<AssetName> for ready-made Blender prefabs
             GameObject projectPrefab = Resources.Load<GameObject>(PrefabResourceFolder + slot.Name);
             if (projectPrefab != null)
             {
-                EnableGpuInstancingOnHierarchy(projectPrefab);
+                MaterialVariantApplier.EnableGpuInstancing(projectPrefab);
                 slot.Template = projectPrefab;
                 slot.IsProceduralFallback = false;
                 return;
             }
 
             // 2. Fallback: build a GPU-instanced low-poly placeholder prototype for immediate testing
-            slot.Template = BuildProceduralPrototype(slot.Name);
+            slot.Template = BuildProceduralPrototype(slot);
             slot.IsProceduralFallback = true;
         }
 
@@ -868,168 +918,225 @@ namespace Asoda.World
             GameObject instanceGo = Object.Instantiate(slot.Template, _pooledPropsRoot, false);
             instanceGo.name = slot.Name;
 
-            MeshRenderer[] renderers;
-            if (slot.IsProceduralFallback)
+            ConfigureLodIfDynamicAsset(slot, instanceGo);
+
+            MeshRenderer[] tintRenderers;
+            if (slot.IsVehicle || slot.IsWeapon)
             {
-                // Tint only the primary surface renderer (index 0) on multi-part fallback prototypes
-                // so tree trunks, roofs, and vehicle canopies preserve their distinct shared materials.
+                // Collect body/receiver renderers across LOD0, LOD1, and LOD2 so colors stay consistent across LOD transitions
+                tintRenderers = MaterialVariantApplier.CollectPrimaryTintRenderers(instanceGo, isVehicle: slot.IsVehicle);
+            }
+            else if (slot.IsProceduralFallback)
+            {
                 MeshRenderer primary = instanceGo.GetComponentInChildren<MeshRenderer>(true);
-                renderers = primary != null ? new[] { primary } : Array.Empty<MeshRenderer>();
+                tintRenderers = primary != null ? new[] { primary } : Array.Empty<MeshRenderer>();
             }
             else
             {
-                renderers = instanceGo.GetComponentsInChildren<MeshRenderer>(true);
-                for (int i = 0; i < renderers.Length; i++)
-                {
-                    EnableGpuInstancingOnRenderer(renderers[i]);
-                }
+                tintRenderers = instanceGo.GetComponentsInChildren<MeshRenderer>(true);
+                MaterialVariantApplier.EnableGpuInstancing(tintRenderers);
             }
 
-            return new PooledPropInstance(slot.Id, instanceGo, renderers);
+            // Cache static batchable MeshFilter/MeshRenderer pairs once (skipping LODGroup-managed hierarchies)
+            bool canStaticBatch = slot.IsStaticBatchable && instanceGo.GetComponentInChildren<LODGroup>(true) == null;
+            MeshFilter[] staticFilters = Array.Empty<MeshFilter>();
+            MeshRenderer[] staticRenderers = Array.Empty<MeshRenderer>();
+
+            if (canStaticBatch)
+            {
+                MeshFilter[] foundFilters = instanceGo.GetComponentsInChildren<MeshFilter>(true);
+                var validFilters = new List<MeshFilter>(foundFilters.Length);
+                var validRenderers = new List<MeshRenderer>(foundFilters.Length);
+
+                for (int i = 0; i < foundFilters.Length; i++)
+                {
+                    MeshFilter mf = foundFilters[i];
+                    if (mf == null)
+                    {
+                        continue;
+                    }
+
+                    MeshRenderer mr = mf.GetComponent<MeshRenderer>();
+                    if (mr != null)
+                    {
+                        validFilters.Add(mf);
+                        validRenderers.Add(mr);
+                    }
+                }
+
+                staticFilters = validFilters.ToArray();
+                staticRenderers = validRenderers.ToArray();
+            }
+
+            return new PooledPropInstance(
+                slot.Id,
+                instanceGo,
+                tintRenderers,
+                canStaticBatch,
+                staticFilters,
+                staticRenderers);
+        }
+
+        private static void ConfigureLodIfDynamicAsset(AssetTypeSlot slot, GameObject target)
+        {
+            if (target == null)
+            {
+                return;
+            }
+
+            if (slot.IsVehicle)
+            {
+                LODGroupSetup.ConfigureVehicleLOD(target);
+            }
+            else if (slot.IsWeapon)
+            {
+                LODGroupSetup.ConfigureWeaponLOD(target);
+            }
         }
 
         private void ApplyGpuInstancedVariation(PooledPropInstance instance, MapObjectRecord record)
         {
-            MeshRenderer[] renderers = instance.Renderers;
-            if (renderers == null || renderers.Length == 0)
-            {
-                return;
-            }
-
             AssetTypeSlot slot = _assetTypes[instance.AssetTypeId];
-            Color[] palette = slot.InstancedPalette;
-            if (palette == null || palette.Length == 0)
+            if (slot.InstancedPalette == null || slot.InstancedPalette.Length == 0)
             {
                 return;
             }
 
-            Color chosenColor = palette[record.Variant % palette.Length];
-            if (!slot.IsProceduralFallback)
-            {
-                // On textured Blender prefabs, blend subtly toward white so albedo textures stay crisp
-                chosenColor = Color.Lerp(Color.white, chosenColor, 0.18f);
-            }
-
-            _sharedPropertyBlock.Clear();
-            _sharedPropertyBlock.SetColor(BaseColorPropertyId, chosenColor);
-            _sharedPropertyBlock.SetColor(LegacyColorPropertyId, chosenColor);
-
-            for (int i = 0; i < renderers.Length; i++)
-            {
-                renderers[i].SetPropertyBlock(_sharedPropertyBlock);
-            }
-        }
-
-        private static void EnableGpuInstancingOnHierarchy(GameObject root)
-        {
-            MeshRenderer[] renderers = root.GetComponentsInChildren<MeshRenderer>(true);
-            for (int i = 0; i < renderers.Length; i++)
-            {
-                EnableGpuInstancingOnRenderer(renderers[i]);
-            }
-        }
-
-        private static void EnableGpuInstancingOnRenderer(MeshRenderer renderer)
-        {
-            if (renderer == null)
+            // Static-batched procedural buildings share unified chunk submeshes; non-static & textured assets get per-instance MPB tint
+            if (instance.IsStaticBatchable && slot.IsProceduralFallback)
             {
                 return;
             }
 
-            Material[] sharedMaterials = renderer.sharedMaterials;
-            for (int i = 0; i < sharedMaterials.Length; i++)
-            {
-                Material mat = sharedMaterials[i];
-                if (mat != null && !mat.enableInstancing)
-                {
-                    mat.enableInstancing = true;
-                }
-            }
+            float tintStrength = slot.IsProceduralFallback ? 1.0f : (slot.IsVehicle || slot.IsWeapon ? 0.30f : 0.18f);
+            MaterialVariantApplier.ApplyPaletteVariant(instance.Renderers, slot.InstancedPalette, record.Variant, tintStrength);
         }
 
         #endregion
 
         #region Procedural Low-Poly Stand-In Prototypes (Immediate Zero-Asset Testing)
 
-        private GameObject BuildProceduralPrototype(string typeName)
+        private GameObject BuildProceduralPrototype(AssetTypeSlot slot)
         {
+            string typeName = slot.Name;
             var root = new GameObject($"Template_{typeName}");
             root.transform.SetParent(_templatesRoot, false);
 
             if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Building") ||
                 SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "House"))
             {
-                // Indian low-poly house/shop: main block (primary renderer) + rooftop parapet ledge
-                Material wallMat = CreateTrackedMaterial("Asoda_BuildingWall_Mat", new Color(0.88f, 0.75f, 0.56f, 1f));
-                Material roofMat = CreateTrackedMaterial("Asoda_BuildingRoof_Mat", new Color(0.58f, 0.34f, 0.25f, 1f));
+                Material wallMat = CreateTrackedMaterial("Asoda_BuildingWall_Mat", new Color(0.89f, 0.75f, 0.56f, 1f));
+                Material roofMat = CreateTrackedMaterial("Asoda_BuildingRoof_Mat", new Color(0.60f, 0.35f, 0.25f, 1f));
 
-                CreatePart(root.transform, PrimitiveType.Cube, "Walls", new Vector3(0f, 2.25f, 0f), new Vector3(6.5f, 4.5f, 6.5f), wallMat, keepCollider: true);
-                CreatePart(root.transform, PrimitiveType.Cube, "ParapetRoof", new Vector3(0f, 4.7f, 0f), new Vector3(6.9f, 0.45f, 6.9f), roofMat, keepCollider: false);
+                CreateBoxPart(root.transform, "Walls", new Vector3(0f, 2.25f, 0f), new Vector3(6.5f, 4.5f, 6.5f), wallMat, addBoxCollider: true);
+                CreateBoxPart(root.transform, "ParapetRoof", new Vector3(0f, 4.7f, 0f), new Vector3(6.9f, 0.45f, 6.9f), roofMat, addBoxCollider: false);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Road"))
+            {
+                Material roadMat = CreateTrackedMaterial("Asoda_RoadAsphalt_Mat", new Color(0.28f, 0.27f, 0.29f, 1f));
+                CreateBoxPart(root.transform, "RoadSlab", new Vector3(0f, 0.03f, 0f), new Vector3(9.0f, 0.08f, 12.5f), roadMat, addBoxCollider: false);
             }
             else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Tree"))
             {
-                // Canopy placed FIRST in hierarchy so primary tintable renderer = foliage canopy!
                 Material canopyMat = CreateTrackedMaterial("Asoda_TreeCanopy_Mat", new Color(0.24f, 0.54f, 0.22f, 1f));
                 Material trunkMat = CreateTrackedMaterial("Asoda_TreeTrunk_Mat", new Color(0.42f, 0.27f, 0.16f, 1f));
 
-                CreatePart(root.transform, PrimitiveType.Sphere, "Canopy", new Vector3(0f, 4.2f, 0f), new Vector3(3.8f, 3.2f, 3.8f), canopyMat, keepCollider: false);
-                CreatePart(root.transform, PrimitiveType.Cylinder, "Trunk", new Vector3(0f, 1.4f, 0f), new Vector3(0.55f, 1.4f, 0.55f), trunkMat, keepCollider: true);
+                CreatePrimitivePart(root.transform, PrimitiveType.Sphere, "Canopy", new Vector3(0f, 4.2f, 0f), new Vector3(3.8f, 3.2f, 3.8f), canopyMat, keepCollider: false);
+                CreatePrimitivePart(root.transform, PrimitiveType.Cylinder, "Trunk", new Vector3(0f, 1.4f, 0f), new Vector3(0.55f, 1.4f, 0.55f), trunkMat, keepCollider: true);
             }
             else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Mandir"))
             {
-                // Traditional Indian Mandir silhouette: raised jagati plinth + garbhagriha + stepped shikhara spire
                 Material stoneMat = CreateTrackedMaterial("Asoda_MandirStone_Mat", new Color(0.92f, 0.62f, 0.28f, 1f));
                 Material plinthMat = CreateTrackedMaterial("Asoda_MandirPlinth_Mat", new Color(0.76f, 0.62f, 0.46f, 1f));
                 Material kalashMat = CreateTrackedMaterial("Asoda_MandirKalash_Mat", new Color(0.95f, 0.80f, 0.22f, 1f));
 
-                CreatePart(root.transform, PrimitiveType.Cube, "Garbhagriha", new Vector3(0f, 3.0f, 0f), new Vector3(6.0f, 4.0f, 6.0f), stoneMat, keepCollider: true);
-                CreatePart(root.transform, PrimitiveType.Cube, "JagatiPlinth", new Vector3(0f, 0.5f, 0f), new Vector3(9.0f, 1.0f, 9.0f), plinthMat, keepCollider: true);
-                CreatePart(root.transform, PrimitiveType.Cube, "ShikharaTier1", new Vector3(0f, 6.0f, 0f), new Vector3(4.2f, 2.2f, 4.2f), stoneMat, keepCollider: false);
-                CreatePart(root.transform, PrimitiveType.Cube, "ShikharaTier2", new Vector3(0f, 8.0f, 0f), new Vector3(2.5f, 2.0f, 2.5f), stoneMat, keepCollider: false);
-                CreatePart(root.transform, PrimitiveType.Sphere, "Kalash", new Vector3(0f, 9.5f, 0f), new Vector3(1.1f, 1.3f, 1.1f), kalashMat, keepCollider: false);
+                CreateBoxPart(root.transform, "Garbhagriha", new Vector3(0f, 3.0f, 0f), new Vector3(6.0f, 4.0f, 6.0f), stoneMat, addBoxCollider: true);
+                CreateBoxPart(root.transform, "JagatiPlinth", new Vector3(0f, 0.5f, 0f), new Vector3(9.0f, 1.0f, 9.0f), plinthMat, addBoxCollider: true);
+                CreateBoxPart(root.transform, "ShikharaTier1", new Vector3(0f, 6.0f, 0f), new Vector3(4.2f, 2.2f, 4.2f), stoneMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "ShikharaTier2", new Vector3(0f, 8.0f, 0f), new Vector3(2.5f, 2.0f, 2.5f), stoneMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Kalash", new Vector3(0f, 9.4f, 0f), new Vector3(1.0f, 1.2f, 1.0f), kalashMat, addBoxCollider: false);
             }
             else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Vehicle"))
             {
-                // Compact Indian auto-rickshaw / utility vehicle silhouette
+                // Multi-part Indian auto-rickshaw / vehicle: Chassis + Canopy + 4 Wheels (demonstrates automatic LOD0 -> LOD1 -> LOD2)
                 Material bodyMat = CreateTrackedMaterial("Asoda_VehicleBody_Mat", new Color(0.16f, 0.56f, 0.29f, 1f));
-                Material canopyMat = CreateTrackedMaterial("Asoda_VehicleTop_Mat", new Color(0.92f, 0.78f, 0.18f, 1f));
+                Material canopyMat = CreateTrackedMaterial("Asoda_VehicleCanopy_Mat", new Color(0.92f, 0.78f, 0.18f, 1f));
+                Material tireMat = CreateTrackedMaterial("Asoda_VehicleWheel_Mat", new Color(0.15f, 0.15f, 0.16f, 1f));
 
-                CreatePart(root.transform, PrimitiveType.Cube, "Chassis", new Vector3(0f, 0.65f, 0f), new Vector3(1.7f, 0.9f, 3.1f), bodyMat, keepCollider: true);
-                CreatePart(root.transform, PrimitiveType.Cube, "Canopy", new Vector3(0f, 1.45f, -0.15f), new Vector3(1.6f, 0.75f, 2.2f), canopyMat, keepCollider: false);
+                CreateBoxPart(root.transform, "Chassis", new Vector3(0f, 0.68f, 0f), new Vector3(1.7f, 0.88f, 3.2f), bodyMat, addBoxCollider: true);
+                CreateBoxPart(root.transform, "Canopy", new Vector3(0f, 1.48f, -0.15f), new Vector3(1.62f, 0.75f, 2.2f), canopyMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Wheel_FL", new Vector3(-0.82f, 0.32f, 1.05f), new Vector3(0.28f, 0.62f, 0.62f), tireMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Wheel_FR", new Vector3( 0.82f, 0.32f, 1.05f), new Vector3(0.28f, 0.62f, 0.62f), tireMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Wheel_RL", new Vector3(-0.82f, 0.32f, -1.05f), new Vector3(0.28f, 0.62f, 0.62f), tireMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Wheel_RR", new Vector3( 0.82f, 0.32f, -1.05f), new Vector3(0.28f, 0.62f, 0.62f), tireMat, addBoxCollider: false);
+
+                LODGroupSetup.ConfigureVehicleLOD(root);
+            }
+            else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Weapon"))
+            {
+                Material metalMat = CreateTrackedMaterial("Asoda_WeaponReceiver_Mat", new Color(0.26f, 0.28f, 0.31f, 1f));
+                Material stockMat = CreateTrackedMaterial("Asoda_WeaponGrip_Mat", new Color(0.44f, 0.28f, 0.17f, 1f));
+
+                CreateBoxPart(root.transform, "Receiver", new Vector3(0f, 0.15f, 0f), new Vector3(0.10f, 0.16f, 0.58f), metalMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Barrel", new Vector3(0f, 0.18f, 0.42f), new Vector3(0.05f, 0.05f, 0.38f), metalMat, addBoxCollider: false);
+                CreateBoxPart(root.transform, "Stock", new Vector3(0f, 0.11f, -0.36f), new Vector3(0.08f, 0.14f, 0.28f), stockMat, addBoxCollider: false);
+
+                LODGroupSetup.ConfigureWeaponLOD(root);
             }
             else if (SliceEqualsIgnoreCase(typeName, 0, typeName.Length, "Lake"))
             {
-                // 2-triangle water surface quad raised slightly above ground (-0.02 -> +0.04) to prevent Z-fighting
                 Material waterMat = CreateTrackedMaterial("Asoda_LakeWater_Mat", new Color(0.16f, 0.49f, 0.64f, 1f));
-                GameObject waterQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
-                waterQuad.name = "WaterSurface";
-                Collider col = waterQuad.GetComponent<Collider>();
-                if (col != null)
-                {
-                    Object.Destroy(col);
-                }
-
-                Transform t = waterQuad.transform;
+                var waterGo = new GameObject("WaterSurface");
+                Transform t = waterGo.transform;
                 t.SetParent(root.transform, false);
-                t.localPosition = new Vector3(0f, 0.04f, 0f);
-                t.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                t.localScale = new Vector3(12f, 12f, 1f);
+                t.localPosition = new Vector3(-6f, 0.04f, -6f);
+                t.localScale = new Vector3(12f, 1f, 12f);
 
-                MeshRenderer mr = waterQuad.GetComponent<MeshRenderer>();
+                var mf = waterGo.AddComponent<MeshFilter>();
+                mf.sharedMesh = _sharedWaterQuadMesh;
+
+                var mr = waterGo.AddComponent<MeshRenderer>();
                 mr.sharedMaterial = waterMat;
                 mr.shadowCastingMode = ShadowCastingMode.Off;
             }
             else
             {
                 Material propMat = CreateTrackedMaterial($"Asoda_{typeName}_Mat", new Color(0.75f, 0.70f, 0.62f, 1f));
-                CreatePart(root.transform, PrimitiveType.Cube, "Mesh", new Vector3(0f, 1.0f, 0f), new Vector3(2.0f, 2.0f, 2.0f), propMat, keepCollider: true);
+                CreateBoxPart(root.transform, "Mesh", new Vector3(0f, 1.0f, 0f), new Vector3(2.0f, 2.0f, 2.0f), propMat, addBoxCollider: true);
             }
 
             root.SetActive(false);
             return root;
         }
 
-        private static void CreatePart(
+        private void CreateBoxPart(
+            Transform parent,
+            string partName,
+            Vector3 localPosition,
+            Vector3 localScale,
+            Material sharedMaterial,
+            bool addBoxCollider)
+        {
+            var part = new GameObject(partName);
+            Transform t = part.transform;
+            t.SetParent(parent, false);
+            t.localPosition = localPosition;
+            t.localRotation = Quaternion.identity;
+            t.localScale = localScale;
+
+            var mf = part.AddComponent<MeshFilter>();
+            mf.sharedMesh = _sharedReadableBoxMesh;
+
+            var mr = part.AddComponent<MeshRenderer>();
+            mr.sharedMaterial = sharedMaterial;
+
+            if (addBoxCollider)
+            {
+                part.AddComponent<BoxCollider>();
+            }
+        }
+
+        private static void CreatePrimitivePart(
             Transform parent,
             PrimitiveType primitiveType,
             string partName,
@@ -1073,14 +1180,12 @@ namespace Asoda.World
 
         private static string TryReadMapJsonText()
         {
-            // 1. Check persistentDataPath override (writable on both Android and Desktop)
             string persistentPath = Path.Combine(Application.persistentDataPath, "map_data.json");
             if (File.Exists(persistentPath))
             {
                 return File.ReadAllText(persistentPath);
             }
 
-            // 2. Check Unity Resources (Assets/_Project/Resources/map_data.json -> packed into Android APK/AAB)
             TextAsset resourceAsset = Resources.Load<TextAsset>(DefaultResourceName);
             if (resourceAsset != null && !string.IsNullOrEmpty(resourceAsset.text))
             {
@@ -1088,7 +1193,6 @@ namespace Asoda.World
             }
 
 #if !UNITY_ANDROID || UNITY_EDITOR
-            // 3. Check StreamingAssets on Editor/Desktop
             string streamingPath = Path.Combine(Application.streamingAssetsPath, "map_data.json");
             if (File.Exists(streamingPath))
             {

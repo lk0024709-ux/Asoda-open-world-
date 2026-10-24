@@ -1,3 +1,4 @@
+using Asoda.Utils;
 using Asoda.World;
 using UnityEngine;
 
@@ -58,7 +59,7 @@ namespace Asoda.Core
         }
 
         /// <summary>
-        /// Composition root for registering pure C# subsystems (World, Player, Camera, Streaming)
+        /// Composition root for registering pure C# subsystems (World, Rendering Optimization, LOD, Player)
         /// into <see cref="GameManager"/> in deterministic priority order.
         /// </summary>
         private static void RegisterCoreSystems(GameManager gameManager)
@@ -69,8 +70,14 @@ namespace Asoda.Core
                 chunkSize: WorldChunkManager.DefaultChunkSize,
                 loadRadius: WorldChunkManager.DefaultLoadRadius);
 
+            // 1. Camera/Input & Mobile Rendering Quality Systems (run before chunk streaming)
             gameManager.RegisterSystem(new WorldTestPreviewSystem(worldChunkManager), priority: -25);
+            gameManager.RegisterSystem(new StylizedFogSystem(worldChunkManager, FogAtmospherePreset.IndianSunsetDust), priority: -15);
+            gameManager.RegisterSystem(new DynamicLodBiasSystem(LodQualityPreset.Auto), priority: -10);
+
+            // 2. Open-World Chunk Streaming (50) followed immediately on the same frame by Static Mesh Batching (60)
             gameManager.RegisterSystem(worldChunkManager, priority: 50);
+            gameManager.RegisterSystem(new StaticMeshCombiner(worldChunkManager), priority: 60);
         }
     }
 }
