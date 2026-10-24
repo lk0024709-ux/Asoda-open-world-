@@ -121,6 +121,27 @@ namespace Asoda.World
         }
 
         /// <summary>
+        /// Immediately processes all currently queued chunks so initial startup frames render batched meshes right away.
+        /// </summary>
+        public void FlushPendingCombinesImmediate()
+        {
+            while (_pendingChunks.Count > 0)
+            {
+                int lastIdx = _pendingChunks.Count - 1;
+                WorldChunk chunk = _pendingChunks[lastIdx];
+                _pendingChunks.RemoveAt(lastIdx);
+                _queuedChunkPoolIds.Remove(chunk.PoolId);
+
+                if (chunk.IsActive && !chunk.HasCombinedStaticMesh)
+                {
+                    CombineChunkStaticMeshes(chunk);
+                }
+            }
+
+            _initialBatchFlushed = true;
+        }
+
+        /// <summary>
         /// Immediately combines all static batchable meshes (houses, buildings, mandirs, roads) inside <paramref name="chunk"/>
         /// into the chunk's reusable <see cref="WorldChunk.CombinedStaticMesh"/>.
         /// </summary>
