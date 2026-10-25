@@ -1,0 +1,112 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  buildAndroid:
+    name: Build Android APK (IL2CPP + ARM64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Runner Disk Space for Unity Android + IL2CPP Image
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      # Note: actions/cache@v4 replaces actions/cache@v3 (whose legacy v1 cache backend was retired by GitHub)
+      - name: Cache Unity Library Folder
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-Android-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-Android-
+
+      - name: Verify Unity License Secrets
+        env:
+          HAS_LICENSE: ${{ secrets.UNITY_LICENSE != '' }}
+          HAS_SERIAL: ${{ secrets.UNITY_SERIAL != '' }}
+          HAS_EMAIL: ${{ secrets.UNITY_EMAIL != '' }}
+          HAS_PASSWORD: ${{ secrets.UNITY_PASSWORD != '' }}
+        run: |
+          if [ "$HAS_EMAIL" != "true" ] || [ "$HAS_PASSWORD" != "true" ] || { [ "$HAS_LICENSE" != "true" ] && [ "$HAS_SERIAL" != "true" ]; }; then
+            {
+              echo "## Unity License Secrets Required"
+              echo "Add the following repository secrets under **Settings → Secrets and variables → Actions**:"
+              echo "- \`UNITY_EMAIL\`: Your Unity ID email address"
+              echo "- \`UNITY_PASSWORD\`: Your Unity ID password"
+              echo "- \`UNITY_LICENSE\`: Full XML contents of your activated \`Unity_lic.ulf\` file (Personal license), **or** \`UNITY_SERIAL\` (Unity Plus/Pro)"
+              echo ""
+              echo "See [\`CI_CD_SETUP.md\`](./CI_CD_SETUP.md) in the repository root for exact OS file paths and setup instructions."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Missing Unity CI secrets (UNITY_EMAIL, UNITY_PASSWORD, and UNITY_LICENSE or UNITY_SERIAL). See CI_CD_SETUP.md."
+            exit 1
+          fi
+
+      - name: Build Android APK with GameCI
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          targetPlatform: Android
+          unityVersion: auto
+          buildName: AsodaOpenWorld
+          buildsPath: build
+          # In game-ci/unity-builder@v4, 'androidPackage' produces a direct .apk (not .aab)
+          androidExportType: androidPackage
+          androidTargetSdkVersion: 34
+          buildMethod: BuildCommand.PerformBuild
+          androidKeystoreName: ${{ secrets.ANDROID_KEYSTORE_NAME }}
+          androidKeystoreBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          androidKeystorePass: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          androidKeyaliasName: ${{ secrets.ANDROID_KEYALIAS_NAME }}
+          androidKeyaliasPass: ${{ secrets.ANDROID_KEYALIAS_PASS }}
+
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AsodaOpenWorld-Android-APK-${{ github.run_number }}
+          path: build/Android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release with APK
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.1.{0}', github.run_number) }}
+          name: Asoda Open World Android APK (Build #${{ github.run_number }})
+          files: build/Android/*.apk
+          generate_release_notes: true
+          make_latest: 'true'
