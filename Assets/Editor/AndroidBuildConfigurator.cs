@@ -10,10 +10,9 @@ using UnityEditor.SceneManagement;
 using UnityEngine;
 
 /// <summary>
-/// Enforces Android ARM64 architecture, IL2CPP scripting backend, Target SDK 34, landscape orientation,
-/// package identifier, bootstrap scene registration, and runtime shader inclusion before every Android build.
-/// Runs automatically in GameCI Ubuntu headless builds via both <see cref="InitializeOnLoadMethodAttribute"/>
-/// and <see cref="IPreprocessBuildWithReport"/>.
+/// Configures Android package identifier, Target SDK 34, landscape orientation, Vehicle tag,
+/// lightweight runtime shaders, and bootstrap scene registration, then delegates Graphics APIs,
+/// Scripting Backend (Mono fast CI default / optional IL2CPP), and Shader Stripping to <see cref="BuildConfigurator"/>.
 /// </summary>
 public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
 {
@@ -23,12 +22,13 @@ public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
     public const string DefaultBootstrapScenePath = "Assets/_Project/Scenes/AsodaBootstrap.unity";
     public const int TargetAndroidApiLevel = 34;
 
+    // Lightweight shaders only — "Standard" is intentionally excluded from AlwaysIncludedShaders
+    // so Unity does not expand all 98,304 uber-shader variants during CI builds.
     private static readonly string[] RequiredRuntimeShaderNames =
     {
-        "Standard",
         "Legacy Shaders/Diffuse",
         "UI/Default",
-        "Asoda/Skybox/StylizedIndianSunset"
+        "Asoda/StylizedIndianSunsetSkybox"
     };
 
     public int callbackOrder => -100;
@@ -47,11 +47,11 @@ public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
         }
     }
 
-    [MenuItem("Asoda/Build/Configure Android (ARM64 + IL2CPP)")]
+    [MenuItem("Asoda/Build/Configure Android Target Settings")]
     public static void ApplyAndroidBuildSettingsMenu()
     {
         ApplyAndroidBuildSettings();
-        Debug.Log("[AndroidBuildConfigurator] Applied Android ARM64 + IL2CPP settings via menu.");
+        Debug.Log("[AndroidBuildConfigurator] Applied Android target settings via menu.");
     }
 
     public void OnPreprocessBuild(BuildReport report)
@@ -63,9 +63,10 @@ public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
     }
 
     /// <summary>
-    /// Enforces ARM64 + IL2CPP + Android SDK 34 + APK settings and prevents runtime shader stripping.
+    /// Applies Android SDK 34, package ID, landscape orientation, lightweight runtime shaders, bootstrap scene,
+    /// and invokes <see cref="BuildConfigurator.ApplyBuildConfiguration"/> for Mono/Graphics APIs/Shader Stripping.
     /// </summary>
-    public static void ApplyAndroidBuildSettings()
+    public static void ApplyAndroidBuildSettings(ScriptingImplementation? backendOverride = null)
     {
         // 1. Ensure valid Company, Product, and Android Application Identifier (Package Name)
         if (string.IsNullOrWhiteSpace(PlayerSettings.companyName) ||
@@ -87,28 +88,15 @@ public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
         {
             PlayerSettings.SetApplicationIdentifier(androidTarget, DefaultPackageIdentifier);
         }
-
-        // 2. Enforce IL2CPP Scripting Backend & Release C++ Codegen
-        PlayerSettings.SetScriptingBackend(androidTarget, ScriptingImplementation.IL2CPP);
-        PlayerSettings.SetIl2CppCompilerConfiguration(androidTarget, Il2CppCompilerConfiguration.Release);
-        PlayerSettings.SetManagedStrippingLevel(androidTarget, ManagedStrippingLevel.Low);
 #else
         string currentAppId = PlayerSettings.GetApplicationIdentifier(BuildTargetGroup.Android);
         if (IsDefaultOrEmptyPackageId(currentAppId))
         {
             PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, DefaultPackageIdentifier);
         }
-
-        PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
-        PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, Il2CppCompilerConfiguration.Release);
-        PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.Android, ManagedStrippingLevel.Low);
 #endif
 
-        // 3. Enforce 64-bit ARM64 architecture ONLY (skips 32-bit ARMv7 to halve Ubuntu IL2CPP build time)
-        PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64;
-        PlayerSettings.stripEngineCode = true;
-
-        // 4. Enforce Android Min SDK (API 24 / Android 7.0) & Target SDK (API 34 / Android 14)
+        // 2. Enforce Android Min SDK (API 24 / Android 7.0) & Target SDK (API 34 / Android 14)
         if ((int)PlayerSettings.Android.minSdkVersion < (int)AndroidSdkVersions.AndroidApiLevel24)
         {
             PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel24;
@@ -120,23 +108,27 @@ public sealed class AndroidBuildConfigurator : IPreprocessBuildWithReport
             PlayerSettings.Android.targetSdkVersion = (AndroidSdkVersions)TargetAndroidApiLevel;
         }
 
-        // 5. Landscape widescreen orientation for dual-thumb mobile open-world controls
+        // 3. Landscape widescreen orientation for dual-thumb mobile open-world controls
         PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
         PlayerSettings.allowedAutorotateToLandscapeLeft = true;
         PlayerSettings.allowedAutorotateToLandscapeRight = true;
         PlayerSettings.allowedAutorotateToPortrait = false;
         PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
 
-        // 6. Ensure Vehicle custom tag, runtime shaders, and bootstrap scene are registered
+        // 4. Register Vehicle custom tag, lightweight shaders, and bootstrap scene
         EnsureVehicleTagRegistered();
         EnsureRequiredRuntimeShadersIncluded();
         EnsureBootstrapSceneRegistered();
 
+        // 5. Apply Vulkan+OpenGLES3, Mono/IL2CPP backend + matching arch, and GraphicsSettings shader stripping
+        BuildConfigurator.ApplyBuildConfiguration(backendOverride);
+
         AssetDatabase.SaveAssets();
 
         Debug.Log(
-            $"[AndroidBuildConfigurator] Enforced Android IL2CPP + ARM64 | " +
+            $"[AndroidBuildConfigurator] Configured Android | " +
             $"AppId={DefaultPackageIdentifier} | " +
+            $"Arch={PlayerSettings.Android.targetArchitectures} | " +
             $"MinSDK={(int)PlayerSettings.Android.minSdkVersion} | " +
             $"TargetSDK={(int)PlayerSettings.Android.targetSdkVersion}");
     }
@@ -271,8 +263,16 @@ public static class BuildCommand
     {
         Dictionary<string, string> args = ParseCommandLineArgs();
 
-        // 1. Enforce ARM64 + IL2CPP + SDK 34 + Runtime Shaders + Bootstrap Scene
-        AndroidBuildConfigurator.ApplyAndroidBuildSettings();
+        ScriptingImplementation? backendOverride = null;
+        if (args.TryGetValue("scriptingBackend", out string backendArg) && !string.IsNullOrEmpty(backendArg))
+        {
+            backendOverride = string.Equals(backendArg, "IL2CPP", StringComparison.OrdinalIgnoreCase)
+                ? ScriptingImplementation.IL2CPP
+                : ScriptingImplementation.Mono2x;
+        }
+
+        // 1. Apply Android target settings + BuildConfigurator (Vulkan+GLES3, Mono/IL2CPP, Shader Stripping)
+        AndroidBuildConfigurator.ApplyAndroidBuildSettings(backendOverride);
 
         // 2. Apply GameCI CLI overrides when passed
         if (args.TryGetValue("buildVersion", out string buildVersion) && !string.IsNullOrEmpty(buildVersion))
@@ -347,7 +347,16 @@ public static class BuildCommand
             options = BuildOptions.None
         };
 
-        Debug.Log($"[BuildCommand] Starting Android IL2CPP ARM64 APK build -> {outputPath} ({scenes.Length} scene(s))");
+#if UNITY_2021_2_OR_NEWER
+        ScriptingImplementation activeBackend = PlayerSettings.GetScriptingBackend(NamedBuildTarget.Android);
+#else
+        ScriptingImplementation activeBackend = PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android);
+#endif
+
+        Debug.Log(
+            $"[BuildCommand] Starting Android APK build ({activeBackend}, {PlayerSettings.Android.targetArchitectures}) -> " +
+            $"{outputPath} ({scenes.Length} scene(s))");
+
         BuildReport report = BuildPipeline.BuildPlayer(buildPlayerOptions);
         BuildSummary summary = report.summary;
 

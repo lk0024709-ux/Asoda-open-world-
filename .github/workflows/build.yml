@@ -20,11 +20,12 @@ concurrency:
 
 jobs:
   buildAndroid:
-    name: Build Android APK (IL2CPP + ARM64)
+    name: Build Android APK (Mono + Stripped Shaders)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Free Runner Disk Space for Unity Android + IL2CPP Image
+      - name: Free Runner Disk Space for Unity Android Image
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
@@ -45,9 +46,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: Library
-          key: Library-Android-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          key: Library-Android-Mono-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
           restore-keys: |
-            Library-Android-
+            Library-Android-Mono-
 
       - name: Verify Unity Credentials Secrets
         env:
@@ -141,11 +142,14 @@ jobs:
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
           UNITY_SERIAL: ${{ steps.license_bridge.outputs.serial }}
+          SCRIPTING_BACKEND: Mono
         with:
           targetPlatform: Android
           unityVersion: auto
           buildName: AsodaOpenWorld
           buildsPath: build
+          scriptingBackend: Mono
+          customParameters: -scriptingBackend Mono
           skipActivation: ${{ steps.license_bridge.outputs.skip_activation }}
           androidExportType: androidPackage
           androidTargetSdkVersion: 34
