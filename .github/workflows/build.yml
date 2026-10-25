@@ -66,12 +66,17 @@ jobs:
             echo "::error::Missing UNITY_EMAIL or UNITY_PASSWORD secret in GitHub Actions settings."
             exit 1
           fi
-
-      - name: Install Unity Hub Licensing Client
-        run: |
-          sudo mkdir -p /usr/share/unity3d/config
+          # Unity Hub 3.20+ installs to /usr/lib/unityhub while buildalon/*@v2 checks /opt/unityhub/unityhub
+          sudo mkdir -p /usr/lib/unityhub /usr/share/unity3d/config
+          sudo ln -sfn /usr/lib/unityhub /opt/unityhub
           sudo chmod -R 777 /usr/share/unity3d
-          npx --yes @rage-against-the-pixel/unity-cli hub-install
+
+      - name: Setup Unity Hub and Licensing Client
+        uses: buildalon/unity-setup@v2
+        with:
+          unity-version: None
+          version-file: None
+          cache-installation: true
 
       - name: Activate Personal Unity License Online
         uses: buildalon/activate-unity-license@v2
