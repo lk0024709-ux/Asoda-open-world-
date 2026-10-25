@@ -41,7 +41,6 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      # Note: actions/cache@v4 replaces actions/cache@v3 (whose legacy v1 cache backend was retired by GitHub)
       - name: Cache Unity Library Folder
         uses: actions/cache@v4
         with:
@@ -50,40 +49,99 @@ jobs:
           restore-keys: |
             Library-Android-
 
-      - name: Verify Unity License Secrets
+      - name: Verify Unity Credentials Secrets
         env:
-          HAS_LICENSE: ${{ secrets.UNITY_LICENSE != '' }}
-          HAS_SERIAL: ${{ secrets.UNITY_SERIAL != '' }}
           HAS_EMAIL: ${{ secrets.UNITY_EMAIL != '' }}
           HAS_PASSWORD: ${{ secrets.UNITY_PASSWORD != '' }}
         run: |
-          if [ "$HAS_EMAIL" != "true" ] || [ "$HAS_PASSWORD" != "true" ] || { [ "$HAS_LICENSE" != "true" ] && [ "$HAS_SERIAL" != "true" ]; }; then
+          if [ "$HAS_EMAIL" != "true" ] || [ "$HAS_PASSWORD" != "true" ]; then
             {
-              echo "## Unity License Secrets Required"
-              echo "Add the following repository secrets under **Settings → Secrets and variables → Actions**:"
+              echo "## Unity Credentials Required"
+              echo "Add the following two repository secrets under **Settings → Secrets and variables → Actions**:"
               echo "- \`UNITY_EMAIL\`: Your Unity ID email address"
               echo "- \`UNITY_PASSWORD\`: Your Unity ID password"
-              echo "- \`UNITY_LICENSE\`: Full XML contents of your activated \`Unity_lic.ulf\` file (Personal license), **or** \`UNITY_SERIAL\` (Unity Plus/Pro)"
               echo ""
-              echo "See [\`CI_CD_SETUP.md\`](./CI_CD_SETUP.md) in the repository root for exact OS file paths and setup instructions."
+              echo "No PC or manual license file is required — Personal license activation runs automatically online."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Missing Unity CI secrets (UNITY_EMAIL, UNITY_PASSWORD, and UNITY_LICENSE or UNITY_SERIAL). See CI_CD_SETUP.md."
+            echo "::error::Missing UNITY_EMAIL or UNITY_PASSWORD secret in GitHub Actions settings."
             exit 1
           fi
+
+      - name: Install Unity Hub Licensing Client
+        run: |
+          sudo mkdir -p /usr/share/unity3d/config
+          sudo chmod -R 777 /usr/share/unity3d
+          npx --yes @rage-against-the-pixel/unity-cli hub-install
+
+      - name: Activate Personal Unity License Online
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: Personal
+          username: ${{ secrets.UNITY_EMAIL }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Bridge Online Activated Seat to GameCI Container
+        id: license_bridge
+        run: |
+          python3 - <<'PY'
+          import base64, glob, os, re, shutil, subprocess
+
+          home = os.path.expanduser("~")
+          unity_share = os.path.join(home, ".local", "share", "unity3d")
+          unity_cfg = os.path.join(home, ".config", "unity3d")
+          serial = ""
+
+          for candidate in glob.glob(os.path.join(unity_share, "**", "*"), recursive=True):
+              if not os.path.isfile(candidate):
+                  continue
+              try:
+                  with open(candidate, "r", encoding="utf-8", errors="ignore") as fh:
+                      content = fh.read()
+                  m = re.search(r'<DeveloperData\s+Value="([^"]+)"', content)
+                  if m:
+                      decoded = base64.b64decode(m.group(1))[4:].decode("latin1").strip()
+                      if decoded:
+                          serial = decoded
+                          break
+              except Exception:
+                  pass
+
+          gh_out = os.environ["GITHUB_OUTPUT"]
+          if serial:
+              print(f"::add-mask::{serial}")
+              if len(serial) > 4:
+                  print(f"::add-mask::{serial[:-4]}XXXX")
+              subprocess.run(
+                  ["npx", "--yes", "@rage-against-the-pixel/unity-cli", "return-license", "-l", "personal"],
+                  check=False,
+              )
+              with open(gh_out, "a", encoding="utf-8") as out:
+                  out.write(f"serial={serial}\n")
+                  out.write("skip_activation=false\n")
+          else:
+              container_home = os.path.join(os.environ["RUNNER_TEMP"], "_github_home")
+              for src, rel in [(unity_share, ".local/share/unity3d"), (unity_cfg, ".config/unity3d")]:
+                  if os.path.isdir(src):
+                      dst = os.path.join(container_home, rel)
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      shutil.copytree(src, dst, dirs_exist_ok=True)
+              with open(gh_out, "a", encoding="utf-8") as out:
+                  out.write("serial=ONLINE-PERSONAL\n")
+                  out.write("skip_activation=true\n")
+          PY
 
       - name: Build Android APK with GameCI
         uses: game-ci/unity-builder@v4
         env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_SERIAL: ${{ steps.license_bridge.outputs.serial }}
         with:
           targetPlatform: Android
           unityVersion: auto
           buildName: AsodaOpenWorld
           buildsPath: build
-          # In game-ci/unity-builder@v4, 'androidPackage' produces a direct .apk (not .aab)
+          skipActivation: ${{ steps.license_bridge.outputs.skip_activation }}
           androidExportType: androidPackage
           androidTargetSdkVersion: 34
           buildMethod: BuildCommand.PerformBuild
